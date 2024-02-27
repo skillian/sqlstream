@@ -3,38 +3,53 @@ package sqlstream
 import (
 	"io"
 	"reflect"
+	"strconv"
 	"unicode/utf8"
 	"unsafe"
 )
 
 func tryFlush(v interface{}) (flushed bool, err error) {
-	fr, ok := unwrapTo[interface{ Flush() error }](v)
-	if !ok {
-		return
+	var flusher interface{ Flush() error }
+	if unwrap(v, &flusher) {
+		return true, flusher.Flush()
 	}
-	return true, fr.Flush()
+	return
 }
 
-func unwrapTo[T any](v interface{}) (unwrapped T, isUnwrapped bool) {
+func unwrap(v interface{}, target interface{}) (isUnwrapped bool) {
+	const errorFormat = "unwrap(%#v, %#v): %s"
+	targetValue := reflect.ValueOf(target)
+	if !targetValue.IsValid() {
+		logger.Warn3(errorFormat, v, target, "target is not valid")
+		return false
+	}
+	if targetValue.Kind() != reflect.Ptr {
+		logger.Warn3(errorFormat, v, target, "target is not a pointer")
+		return false
+	}
+	if targetValue.IsNil() {
+		logger.Warn3(errorFormat, v, target, "target is nil")
+		return false
+	}
+	targetElementType := targetValue.Type().Elem()
+	valueValue := reflect.ValueOf(v)
 	for {
-		unwrapped, isUnwrapped = v.(T)
-		if !isUnwrapped {
-			v, isUnwrapped = unwrap(v)
-			if !isUnwrapped {
-				return
-			}
-			continue
+		if !valueValue.IsValid() {
+			return false
 		}
-		return
+		if valueValue.Type().ConvertibleTo(targetElementType) {
+			targetValue.Elem().Set(valueValue.Convert(targetElementType))
+			return true
+		}
+		m, ok := valueValue.Type().MethodByName("Unwrap")
+		if !ok {
+			return false
+		}
+		if m.Type.NumIn() != 1 && m.Type.NumOut() != 1 {
+			return false
+		}
+		valueValue = m.Func.Call([]reflect.Value{valueValue})[0]
 	}
-}
-
-func unwrap(v interface{}) (unwrapped interface{}, isUnwrapped bool) {
-	ur, ok := v.(interface{ Unwrap() interface{} })
-	if !ok {
-		return
-	}
-	return ur.Unwrap(), true
 }
 
 type runeWriter interface{ WriteRune(rune) (int, error) }
@@ -53,8 +68,7 @@ func smallWriterOf(w io.Writer) smallWriter {
 		return sw
 	}
 	sw := &smallWriterWrapper{w: w, enc: utf8.EncodeRune}
-	var ok bool
-	if sw.bw, ok = unwrapTo[io.ByteWriter](w); ok {
+	if unwrap(w, &sw.bw) {
 		sw.writeByte = func(sw *smallWriterWrapper, b byte) error {
 			return sw.bw.WriteByte(b)
 		}
@@ -65,7 +79,7 @@ func smallWriterOf(w io.Writer) smallWriter {
 			return err
 		}
 	}
-	if sw.rw, ok = unwrapTo[runeWriter](w); ok {
+	if unwrap(w, &sw.rw) {
 		sw.writeRune = func(sw *smallWriterWrapper, r rune) (int, error) {
 			return sw.rw.WriteRune(r)
 		}
@@ -75,7 +89,7 @@ func smallWriterOf(w io.Writer) smallWriter {
 			return sw.Write(sw.buf[:i])
 		}
 	}
-	if sw.sw, ok = unwrapTo[io.StringWriter](w); ok {
+	if unwrap(w, &sw.sw) {
 		sw.writeString = func(sw *smallWriterWrapper, s string) (int, error) {
 			return sw.sw.WriteString(s)
 		}
@@ -113,7 +127,7 @@ type smallWriterWrapper struct {
 	// enc encodes runes into bytes that are written to Writer.
 	enc func([]byte, rune) int
 
-	buf [6]byte // should be just 4, per RFC3629, but just in case
+	buf [32]byte
 }
 
 func (sw *smallWriterWrapper) Unwrap() interface{} { return sw.w }
@@ -126,6 +140,10 @@ func (sw *smallWriterWrapper) Write(bs []byte) (n int, err error) {
 func (sw *smallWriterWrapper) WriteByte(b byte) (err error) {
 	err = sw.writeByte(sw, b)
 	return
+}
+
+func (sw *smallWriterWrapper) WriteInt(v int64, base int) (n int, err error) {
+	return sw.Write(strconv.AppendInt(sw.buf[:0], v, base))
 }
 
 func (sw *smallWriterWrapper) WriteRune(r rune) (n int, err error) {

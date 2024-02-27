@@ -1,12 +1,15 @@
 package sqlstream
 
 import (
+	"context"
+	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
-	"github.com/skillian/sqlstream/sqllang"
-	"github.com/skillian/syng"
+	"github.com/skillian/expr"
 )
 
 // Scanner is implemented by `*sql.DB`, `*sql.Conn`, etc. to scan
@@ -29,8 +32,8 @@ type ValuesAppender interface {
 // Model pairs together an underlying model type and the data
 // necessary to scan to/from it.
 type Model struct {
+	modelType *modelType
 	V         interface{}
-	modelType modelType
 }
 
 var _ interface {
@@ -49,7 +52,7 @@ func ModelOf(v interface{}) Model {
 }
 
 func (m Model) AppendFields(fs []interface{}) []interface{} {
-	flds := m.modelType.fieldV1s()
+	flds := m.modelType.fields
 	for i := range flds {
 		fs = append(fs, flds[i].pointerTo(m.V))
 	}
@@ -57,7 +60,7 @@ func (m Model) AppendFields(fs []interface{}) []interface{} {
 }
 
 func (m Model) AppendValues(vs []interface{}) []interface{} {
-	flds := m.modelType.fieldV1s()
+	flds := m.modelType.fields
 	for i := range flds {
 		vs = append(vs, flds[i].valueOf(m.V))
 	}
@@ -66,100 +69,140 @@ func (m Model) AppendValues(vs []interface{}) []interface{} {
 
 func (m Model) Unwrap() interface{} { return m.V }
 
-type anyModelType interface {
-	// Name is the name of the model type with spaces.  The DB
-	// namer is responsible for coming up with the actual name.
-	Name() string
-
-	// anyFields retrieves field descriptors of all the model's
-	// fields.
-	anyFields() []anyField
-
-	// reflectType gets the reflect.Type of the model
-	reflectType() reflect.Type
-}
-
-func newAny(mt anyModelType) interface{} {
-	if nr, ok := mt.(interface{ newAny() interface{} }); ok {
-		return nr.newAny()
+func newModel(ctx context.Context, mt *modelType) (m Model, err error) {
+	v, err := mt.newFn(mt, ctx)
+	if err != nil {
+		return
 	}
-	return reflect.New(mt.reflectType()).Interface()
+	m.modelType = mt
+	m.V = v
+	return
 }
 
-type anyModelTypesV1 struct {
-	ms   []anyModelType
-	fs   []anyField
-	rt   reflect.Type
-	name string
-}
+var (
+	modelTypeReflectType    = reflect.TypeOf((*modelType)(nil)).Elem()
+	reflectTypeByModelTypes = sync.Map{} // [...]*modelType -> reflect.Type
+)
 
-func modelTypesOf(ms []anyModelType) anyModelType {
+func modelTypesOf(ms []*modelType) (mts *modelType) {
+	arr := reflect.NewAt(
+		reflect.ArrayOf(len(ms), modelTypeReflectType),
+		unsafe.Pointer(&ms[0]),
+	).Elem().Interface()
+	if v, ok := reflectTypeByModelTypes.Load(arr); ok {
+		return modelTypeOfType(v.(reflect.Type), nil)
+	}
 	ns := make([]string, len(ms))
 	sfs := make([]reflect.StructField, len(ms))
-	fs := make([]anyField, 0, arbitraryCapacity)
+	fieldCount := 0
 	for i, m := range ms {
-		ns[i] = m.Name()
+		ns[i] = m.name
 		sfs[i] = reflect.StructField{
 			Name: nameString(ns[i], PascalCase),
-			Type: m.reflectType(),
+			Type: m.reflectType,
 		}
-		fs = append(fs, m.anyFields()...)
+		fieldCount += len(m.fields)
 	}
-	mts := &anyModelTypesV1{
-		ms:   ms,
-		fs:   make([]anyField, len(fs)),
-		rt:   reflect.StructOf(sfs),
-		name: strings.Join(ns, ""),
+	mts = &modelType{
+		fields:      make([]field, 0, fieldCount),
+		reflectType: reflect.StructOf(sfs),
+		name:        strings.Join(ns, ""),
+		components:  ms,
 	}
-	copy(mts.fs, fs)
+	for i, m := range ms {
+		sf := &sfs[i]
+		start := len(mts.fields)
+		mts.fields = append(mts.fields, m.fields...)
+		for j := range mts.fields[start:] {
+			mts.fields[start+j].offset += sf.Offset
+		}
+	}
+	if v, ok := reflectTypeByModelTypes.LoadOrStore(arr, mts.reflectType); ok {
+		return modelTypeOfType(v.(reflect.Type), nil)
+	}
+	modelTypePtrsByReflectType.Store(mts.reflectType, mts)
+	reflectTypeByModelTypes.Store(arr, mts.reflectType)
 	return mts
 }
 
-func (ms *anyModelTypesV1) Name() string              { return ms.name }
-func (ms *anyModelTypesV1) anyFields() []anyField     { return ms.fs }
-func (ms *anyModelTypesV1) reflectType() reflect.Type { return ms.rt }
+var modelTypePtrsByReflectType = sync.Map{} // reflect.Type -> *modelType
 
-type anyField interface {
-	Name() string
-	valueOfAny(structPtr interface{}) (value interface{})
-	pointerToAny(structPtr interface{}) (fieldPointer interface{})
-}
+type modelTypeOption func(mt *modelType) error
 
-type modelType[T any] interface {
-	anyModelType
-	fieldV1s() []fieldV1[T]
-}
-
-var modelTypes = syng.Map[reflect.Type, anyModelType]{}
-
-func modelTypeOf[T any]() modelType[T] {
-	var v *T
-	key := reflect.TypeOf(v).Elem()
-	amt, ok := modelTypes.Load(key)
-	if ok {
-		return amt.(modelType[T])
+func modelTypeOf(v interface{}, options ...modelTypeOption) *modelType {
+	switch v := v.(type) {
+	case Model:
+		return v.modelType
+	case *Model:
+		return v.modelType
 	}
-	parseTag := func(tag string) (name string, tp sqllang.Type) {
+	rt := reflect.TypeOf(v)
+	if rt.Kind() == reflect.Ptr {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct {
+		panic(fmt.Sprint("Cannot get model type of non-struct: ", v))
+	}
+	return modelTypeOfType(rt, options...)
+}
+
+func modelTypeOfType(rt reflect.Type, options ...modelTypeOption) *modelType {
+	key := (interface{})(rt)
+	amt, ok := modelTypePtrsByReflectType.Load(key)
+	if ok {
+		return amt.(*modelType)
+	}
+	parseTag := func(tag string) (name string, ft fieldTag) {
 		var ok bool
 		name, tag, ok = strings.Cut(tag, ",")
 		if !ok {
 			return
 		}
-		var typename string
-		typename, tag, ok = strings.Cut(tag, ",")
-		if typename != "" {
-			panic("TODO: parse types")
+		var valueString string
+		if valueString, tag, ok = strings.Cut(tag, ","); !ok {
+			return
+		}
+		valueString = strings.TrimSpace(valueString)
+		if valueString != "" {
+			v, err := strconv.ParseInt(valueString, 10, 64)
+			if err != nil {
+				panic(err)
+			}
+			ft.scale = v
+		}
+		if valueString, tag, ok = strings.Cut(tag, ","); !ok {
+			return
+		}
+		valueString = strings.TrimSpace(valueString)
+		if valueString != "" {
+			v, err := strconv.ParseInt(valueString, 10, 64)
+			if err != nil {
+				panic(err)
+			}
+			ft.prec = v
+		}
+		if valueString, tag, ok = strings.Cut(tag, ","); !ok {
+			return
+		}
+		valueString = strings.TrimSpace(valueString)
+		if valueString != "" {
+			v, err := strconv.ParseBool(valueString)
+			if err != nil {
+				panic(err)
+			}
+			ft.fixed = v
 		}
 		return
 	}
-	newModelType := func(rt reflect.Type) modelType[T] {
-		mt := &modelTypeV1[T]{}
-		modelFields := make([]fieldV1[T], 0, rt.NumField())
+	newModelType := func(rt reflect.Type, options []modelTypeOption) (mt *modelType) {
+		mt = &modelType{}
+		reflectStructFields := expr.ReflectStructFieldsOfType(rt)
+		modelFields := make([]field, 0, rt.NumField())
 		if cap(modelFields) == 0 {
 			panic("cannot create model type without interface{} fields")
 		}
 		i := 0
-		sf := rt.Field(i)
+		sf := &reflectStructFields[i]
 		if sf.Type == emptyStructType {
 			i++
 			tv, ok := sf.Tag.Lookup(tag)
@@ -172,57 +215,56 @@ func modelTypeOf[T any]() modelType[T] {
 			mt.name = rt.Name()
 		}
 		for ; i < cap(modelFields); i++ {
-			sf = rt.Field(i)
-			modelFields = append(modelFields, fieldV1[T]{
+			sf = &reflectStructFields[i]
+			modelFields = append(modelFields, field{
 				offset: sf.Offset,
 			})
 			mf := &modelFields[len(modelFields)-1]
-			mf.name, _ = parseTag(sf.Name)
+			mf.name, mf.tag = parseTag(sf.Tag.Get(PkgName))
 			if len(mf.name) == 0 {
 				mf.name = sf.Name
 			}
-			rv := reflect.NewAt(sf.Type, unsafe.Pointer(&modelTypes) /* Doesn't matter where */)
+			rv := reflect.NewAt(sf.Type, unsafe.Pointer(&modelTypePtrsByReflectType) /* Doesn't matter where */)
 			x := rv.Interface()
-			mf.pointerType = (*((*[2]unsafe.Pointer)(unsafe.Pointer(&x))))[0]
+			mf.pointerType = ifaceDataOf(unsafe.Pointer(&x)).Type
 			x = rv.Elem().Interface()
-			mf.valueType = (*((*[2]unsafe.Pointer)(unsafe.Pointer(&x))))[0]
-			mf.reflectType = sf.Type
+			mf.valueType = ifaceDataOf(unsafe.Pointer(&x)).Type
+			mf.structField = sf
 		}
-		mt.modelFieldV1s = make([]fieldV1[T], len(modelFields))
-		copy(mt.modelFieldV1s, modelFields)
-		mt.anyModelFields = make([]anyField, len(mt.modelFieldV1s))
-		for i := range mt.modelFieldV1s {
-			mt.anyModelFields[i] = &mt.modelFieldV1s[i]
+		mt.fields = make([]field, len(modelFields))
+		copy(mt.fields, modelFields)
+		for _, opt := range options {
+			if err := opt(mt); err != nil {
+				panic(err)
+			}
 		}
-		return mt
+		if mt.newFn == nil {
+			mt.newFn = (*modelType).defaultNewFunc
+		}
+		return
 	}
-	mt := newModelType(key)
-	amt, ok = modelTypes.LoadOrStore(key, mt)
+	mt := newModelType(rt, options)
+
+	amt, ok = modelTypePtrsByReflectType.LoadOrStore(key, mt)
 	if ok {
-		return amt.(modelType[T])
+		return amt.(*modelType)
 	}
 	return mt
 }
 
-type modelTypeV1 struct {
-	modelFieldV1s []field
+type newModelFunc func(*modelType, context.Context) (interface{}, error)
 
-	// anyModelFields contains the same fields as modelFields but
-	// pre-copied into a properly-typed slice.
-	anyModelFields []anyField
-	rt             reflect.Type
-	name           string
+type modelType struct {
+	fields      []field
+	newFn       newModelFunc
+	reflectType reflect.Type
+	name        string
+	components  []*modelType
 }
 
-var _ interface {
-	modelType[struct{}]
-} = (*modelTypeV1[struct{}])(nil)
-
-func (mt *modelTypeV1[T]) Name() string              { return mt.name }
-func (mt *modelTypeV1[T]) anyFields() []anyField     { return mt.anyModelFields }
-func (mt *modelTypeV1[T]) fields() []field           { return mt.modelFields }
-func (mt *modelTypeV1[T]) newAny() interface{}       { return new(T) }
-func (mt *modelTypeV1[T]) reflectType() reflect.Type { return mt.rt }
+func (mt *modelType) defaultNewFunc(_ context.Context) (interface{}, error) {
+	return reflect.New(mt.reflectType).Interface(), nil
+}
 
 // field is a field of a structure.
 type field struct {
@@ -239,18 +281,28 @@ type field struct {
 	// name is the name of the field
 	name string
 
-	// reflectType is the `reflec.Type` of the field value.
-	reflectType reflect.Type
+	structField *reflect.StructField
+
+	// tag parsed from the struct's field tag
+	tag fieldTag
 }
 
-func (f field) Name() string                           { return f.name }
-func (f field) valueOf(v unsafe.Pointer) interface{}   { return f.getField(v, f.valueType) }
-func (f field) valueOfAny(v interface{}) interface{}   { return f.valueOf() }
-func (f field) pointerTo(v unsafe.Pointer) interface{} { return f.getField(v, f.pointerType) }
-func (f field) pointerToAny(v interface{}) interface{} { return f.pointerTo(v.(*T)) }
+type fieldTag struct {
+	scale int64
+	prec  int64
+	fixed bool
+}
 
 func (f *field) getField(v unsafe.Pointer, pt unsafe.Pointer) (x interface{}) {
 	xp := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
 	(*xp) = [...]unsafe.Pointer{pt, unsafe.Add(v, f.offset)}
 	return
 }
+func (f *field) valueOf(v interface{}) interface{} {
+	return f.valueOf(unsafe.Pointer(reflect.ValueOf(v).Pointer()))
+}
+func (f *field) pointerTo(v interface{}) interface{} {
+	return f.pointerTo(unsafe.Pointer(reflect.ValueOf(v).Pointer()))
+}
+func (f *field) unsafePointerTo(v unsafe.Pointer) interface{} { return f.getField(v, f.pointerType) }
+func (f *field) unsafeValueOf(v unsafe.Pointer) interface{}   { return f.getField(v, f.valueType) }

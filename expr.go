@@ -5,7 +5,6 @@ import (
 	"io"
 	"reflect"
 	"strconv"
-	"strings"
 	"unicode"
 
 	"github.com/skillian/errors"
@@ -13,78 +12,83 @@ import (
 	"github.com/skillian/sqlstream/sqllang"
 )
 
-// ExprWriterTo is used to write expression trees into SQL expression strings
-type ExprWriterTo interface {
+type ExprWriterer interface {
+	ExprWriter(ctx context.Context, w io.Writer) (ExprWriter, error)
+}
+
+type ExprWritererFunc func(context.Context, io.Writer) (ExprWriter, error)
+
+func (f ExprWritererFunc) ExprWriter(ctx context.Context, w io.Writer) (ExprWriter, error) {
+	return f(ctx, w)
+}
+
+// ExprWriter is used to write expression trees into SQL expression strings
+type ExprWriter interface {
 	Args() []interface{}
-	WriteExprTo(ctx context.Context, w io.Writer, e expr.Expr) (int64, error)
+	WriteExpr(ctx context.Context, e expr.Expr) (int64, error)
 }
 
-func tableAliasOf(ctx context.Context, ew ExprWriterTo, q query) (alias string, err error) {
-	sb := strings.Builder{}
-	if _, err = ew.WriteExprTo(ctx, &sb, q); err != nil {
-		return
-	}
-	return sb.String(), nil
+type ExprWriterFunc func(context.Context, expr.Expr) (int64, error)
+
+func (f ExprWriterFunc) WriteExpr(ctx context.Context, e expr.Expr) (int64, error) {
+	return f(ctx, e)
 }
 
-// exprWriterToV1 is a default ExprWriterTo implementation.
-type exprWriterToV1 struct {
-	args     []interface{}
-	prefixes map[anyTable]*ewV1Prefix
+type exprWriter struct {
+	stack    []ewFrame
+	w        smallWriterCounter
+	prefixes map[*table]*ewPrefix
 	aliases  map[query]string
+	params   Parameters
+	dialect  Dialect
+}
+
+type ewFrame struct {
+	e     expr.Expr
+	infix string
+}
+
+type ewPrefix struct {
+	prefix string
+	count  int
 }
 
 var _ interface {
-	ExprWriterTo
-} = (*exprWriterToV1)(nil)
+	ExprWriter
+} = (*exprWriter)(nil)
 
-func (ewt *exprWriterToV1) Args() []interface{} { return ewt.args }
-
-func (ewt *exprWriterToV1) WriteArgTo(ctx context.Context, w io.Writer, v interface{}) (int64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	if va, ok := v.(expr.Var); ok {
-		vs, err := expr.ValuesFromContext(ctx)
-		if err != nil {
-			return 0, err
-		}
-		v, err = vs.Get(ctx, va)
-		if err != nil {
-			return 0, err
-		}
-	}
-	n, err := w.Write(constBytes[qmarkIndex : qmarkIndex+1])
-	if err == nil {
-		ewt.args = append(ewt.args, v)
-	}
-	return int64(n), err
+func (ew *exprWriter) init(w io.Writer, ps Parameters, d Dialect) {
+	ew.w.smallWriter = smallWriterOf(w)
+	ew.prefixes = make(map[*table]*ewPrefix)
+	ew.aliases = make(map[query]string)
+	ew.params = ps
+	ew.dialect = d
 }
 
-func (ewt *exprWriterToV1) WriteExprTo(ctx context.Context, w io.Writer, e expr.Expr) (int64, error) {
-	ew := exprWriterV1{
-		smallWriterCounter: smallWriterCounterOf(w),
-		exprWriterToV1:     ewt,
-		stack:              make([]ewV1Frame, 1, arbitraryCapacity),
-	}
-	err := expr.Walk(ctx, e, &ew)
-	return ew.smallWriterCounter.written, err
+func (ew *exprWriter) Args() []interface{} { return ew.params.Args() }
+
+func (ew *exprWriter) WriteExpr(ctx context.Context, e expr.Expr) (int64, error) {
+	start := ew.w.written
+	err := expr.Walk(ctx, e, (*exprWriterVisitor)(ew))
+	return ew.w.written - start, err
 }
 
-func (ewt *exprWriterToV1) aliasOf(q query) string {
+type exprWriterVisitor exprWriter
+
+func (ewt *exprWriterVisitor) aliasOf(q query) string {
 	al, ok := ewt.aliases[q]
 	if ok {
 		return al
 	}
-	prefixOf := func(ewt *exprWriterToV1, t anyTable) *ewV1Prefix {
+	prefixOf := func(ewt *exprWriterVisitor, t *table) *ewPrefix {
 		ep, ok := ewt.prefixes[t]
 		if ok {
 			return ep
 		}
-		ep = &ewV1Prefix{}
+		ep = &ewPrefix{}
 		alias := make([]rune, 0, 8)
 		space := false
-		for i, r := range t.anyModelType().Name() {
+		for i, r := range t.modelType.name {
 			switch {
 			case i == 0:
 				alias = append(alias, unicode.ToLower(r))
@@ -99,9 +103,9 @@ func (ewt *exprWriterToV1) aliasOf(q query) string {
 		ewt.prefixes[t] = ep
 		return ep
 	}
-	makeAlias := func(ewt *exprWriterToV1, q query) string {
-		t, _ := tableOfQuery(q)
-		oswp := prefixOf(ewt, t)
+	makeAlias := func(ewt *exprWriterVisitor, q query) string {
+		tq := tableQueryOf(q)
+		oswp := prefixOf(ewt, tq.table)
 		alias := oswp.prefix + strconv.FormatInt(int64(oswp.count), 10)
 		oswp.count++
 		return alias
@@ -111,38 +115,22 @@ func (ewt *exprWriterToV1) aliasOf(q query) string {
 	return al
 }
 
-type ewV1Prefix struct {
-	prefix string
-	count  int
-}
-
-type ewV1Frame struct {
-	e     expr.Expr
-	infix string
-}
-
-type exprWriterV1 struct {
-	*smallWriterCounter
-	*exprWriterToV1
-	stack []ewV1Frame
-}
-
-func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, error) {
+func (ew *exprWriterVisitor) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, error) {
 	if e != nil {
 		switch e.(type) {
 		case expr.Mem:
 		case expr.Binary:
-			if err := ew.smallWriterCounter.WriteByte('('); err != nil {
+			if err := ew.w.WriteByte('('); err != nil {
 				return nil, err
 			}
 		}
-		ew.stack = append(ew.stack, ewV1Frame{
+		ew.stack = append(ew.stack, ewFrame{
 			e: e,
 		})
 		top := &ew.stack[len(ew.stack)-1]
 		switch e.(type) {
 		case expr.Not:
-			if _, err := ew.smallWriterCounter.WriteString("NOT "); err != nil {
+			if _, err := ew.w.WriteString("NOT "); err != nil {
 				return nil, err
 			}
 		case expr.Eq:
@@ -180,21 +168,16 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 	switch e.(type) {
 	case expr.Mem:
 	case expr.Binary:
-		if err := ew.smallWriterCounter.WriteByte(')'); err != nil {
+		if err := ew.w.WriteByte(')'); err != nil {
 			return nil, err
 		}
 	}
-	writeIdent := func(ctx context.Context, ew *exprWriterV1, id sqllang.Ident) error {
-		if err := ew.WriteByte('"'); err != nil {
-			return err
-		}
-		if _, err := ew.WriteString(id.String()); err != nil {
-			return err
-		}
-		return ew.WriteByte('"')
+	writeIdent := func(ctx context.Context, ew *exprWriterVisitor, id sqllang.Ident) (err error) {
+		_, err = ew.dialect.Quote(&ew.w, id.String())
+		return
 	}
-	defaultWrite := func(ctx context.Context, ew *exprWriterV1, e expr.Expr) error {
-		_, err := ew.WriteArgTo(ctx, ew.smallWriterCounter, e)
+	defaultWrite := func(ctx context.Context, ew *exprWriterVisitor, e expr.Expr) error {
+		_, err := ew.params.WriteParameterTo(&ew.w, e)
 		return err
 	}
 	if !expr.HasOperands(e) {
@@ -207,7 +190,7 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 				}
 				return false
 			})() {
-				if _, err := ew.smallWriterCounter.WriteString("1 = "); err != nil {
+				if _, err := ew.w.WriteString("1 = "); err != nil {
 					return nil, err
 				}
 			}
@@ -217,11 +200,11 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 			} else {
 				b = '0'
 			}
-			if err := ew.smallWriterCounter.WriteByte(b); err != nil {
+			if err := ew.w.WriteByte(b); err != nil {
 				return nil, err
 			}
 		case query:
-			if _, err := ew.smallWriterCounter.WriteString(ew.aliasOf(e)); err != nil {
+			if _, err := ew.w.WriteString(ew.aliasOf(e)); err != nil {
 				return nil, err
 			}
 		case *reflect.StructField:
@@ -235,8 +218,8 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 						m[0],
 					)
 				}
-				tq := tableQueryV1Of(q)
-				name := tq.table.Columns()[e.Index[0]].Name
+				tq := tableQueryOf(q)
+				name := tq.table.columns[e.Index[0]].name
 				if err := writeIdent(ctx, ew, sqllang.IdentFromString(name)); err != nil {
 					return nil, err
 				}
@@ -256,7 +239,7 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 		}
 	}
 	if len(sec.infix) != 0 {
-		if _, err := ew.smallWriterCounter.WriteString(sec.infix); err != nil {
+		if _, err := ew.w.WriteString(sec.infix); err != nil {
 			return nil, err
 		}
 		sec.infix = ""
@@ -264,9 +247,9 @@ func (ew *exprWriterV1) Visit(ctx context.Context, e expr.Expr) (expr.Visitor, e
 	return ew, nil
 }
 
-func (ew *exprWriterV1) pop() (top ewV1Frame) {
+func (ew *exprWriterVisitor) pop() (top ewFrame) {
 	ptop := &ew.stack[len(ew.stack)-1]
-	top, *ptop = *ptop, ewV1Frame{}
+	top, *ptop = *ptop, ewFrame{}
 	ew.stack = ew.stack[:len(ew.stack)-1]
 	return
 }

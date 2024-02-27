@@ -20,59 +20,10 @@ type Type interface {
 
 // TypeOf gets a default type for a given value
 func TypeOf(v interface{}) Type {
-	switch v.(type) {
-	case int:
-		return IntType
-	case int8:
-		return Int8Type
-	case int16:
-		return Int16Type
-	case int32:
-		return Int32Type
-	case int64:
-		return Int64Type
-	case uint:
-		return UintType
-	case uint8:
-		return Uint8Type
-	case uint16:
-		return Uint16Type
-	case uint32:
-		return Uint32Type
-	case uint64:
-		return Uint64Type
-	case float32:
-		return Float32Type
-	case float64:
-		return Float64Type
-	case *big.Int:
-		return BigIntType
-	case *big.Float:
-		return BigFloatType
-	case *big.Rat:
-		return BigRatType
-	case time.Time:
-		return TimeType
-	case string:
-		return StringType
-	case sql.NullBool:
-		return NullBoolType
-	case sql.NullByte:
-		return NullByteType
-	case sql.NullInt16:
-		return NullInt16Type
-	case sql.NullInt32:
-		return NullInt32Type
-	case sql.NullInt64:
-		return NullInt64Type
-	case sql.NullFloat64:
-		return NullFloat64Type
-	case sql.NullString:
-		return NullStringType
-	case sql.NullTime:
-		return NullTimeType
-	}
 	rt := reflect.TypeOf(v)
+	if st, ok := typeLookups.reflectTypeToSQLType[rt]; ok {
+		return st
+	}
 	switch rt.Kind() {
 	case reflect.Pointer:
 		return Nullable{TypeOf(reflect.Zero(rt.Elem()).Interface())}
@@ -139,6 +90,46 @@ var (
 	bigIntType   = reflect.TypeOf((*big.Int)(nil))
 	bigFloatType = reflect.TypeOf((*big.Float)(nil))
 	bigRatType   = reflect.TypeOf((*big.Rat)(nil))
+
+	typeLookups = func() (lookups struct {
+		reflectTypeToSQLType map[reflect.Type]Type
+		sqlTypeToReflectType map[Type]reflect.Type
+	}) {
+		lookups.reflectTypeToSQLType = map[reflect.Type]Type{}
+		lookups.sqlTypeToReflectType = map[Type]reflect.Type{}
+		for _, p := range []struct {
+			reflectType reflect.Type
+			sqlType     Type
+		}{
+			{intType, IntType},
+			{int8Type, Int8Type},
+			{int16Type, Int16Type},
+			{int32Type, Int32Type},
+			//{uintType, UintType},
+			{uint8Type, Uint8Type},
+			{uint16Type, Uint16Type},
+			{uint32Type, Uint32Type},
+			{float32Type, Float32Type},
+			{float64Type, Float64Type},
+			{bigIntType, BigIntType},
+			{bigFloatType, BigFloatType},
+			{bigRatType, BigRatType},
+			{timeType, TimeType},
+			{stringType, StringType},
+			{nullBoolType, NullBoolType},
+			{nullByteType, NullByteType},
+			{nullInt16Type, NullInt16Type},
+			{nullInt32Type, NullInt32Type},
+			{nullInt64Type, NullInt64Type},
+			{nullFloat64Type, NullFloat64Type},
+			{nullStringType, NullStringType},
+			{nullTimeType, NullTimeType},
+		} {
+			lookups.reflectTypeToSQLType[p.reflectType] = p.sqlType
+			lookups.sqlTypeToReflectType[p.sqlType] = p.reflectType
+		}
+		return
+	}()
 )
 
 type boolType struct{}

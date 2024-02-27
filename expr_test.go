@@ -98,13 +98,13 @@ var exprTests = []exprTest{
 }
 
 func TestExpr(t *testing.T) {
-	testSQLWriterTo := func(ctx context.Context, t *testing.T, dd sqlstream.DriverDialect, e expr.Expr, expect *sqlWriterToExpect) {
+	testSQLWriter := func(ctx context.Context, t *testing.T, dd sqlstream.DriverDialect, e expr.Expr, expect *sqlWriterToExpect) {
 		sb := strings.Builder{}
-		swt, err := dd.SQLWriterTo(ctx)
+		swt, err := dd.SQLWriter(ctx, &sb)
 		if err != nil {
 			t.Fatal(err)
 		}
-		i64, err := swt.WriteExprTo(ctx, &sb, e)
+		i64, err := swt.WriteExpr(ctx, e)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +128,7 @@ func TestExpr(t *testing.T) {
 		tc := &exprTests[i]
 		t.Run(fmt.Sprint(tc.expr), func(t *testing.T) {
 			ctx := context.TODO()
-			testSQLWriterTo(ctx, t, sqlstream.ODBC, tc.expr, &tc.odbc)
+			testSQLWriter(ctx, t, sqlstream.ODBC, tc.expr, &tc.odbc)
 		})
 	}
 }

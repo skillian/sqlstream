@@ -25,13 +25,13 @@ var (
 	}
 )
 
-func foreachIdent[TParameter any](p TParameter, name string, f func(TParameter, string) error) error {
+func foreachIdent(state interface{}, name string, f func(state interface{}, ident string) error) error {
 	const noStart = -1
 	start := noStart
 	for i, r := range name {
 		if !unicode.In(r, unicodeLetterOrNumber[:]...) {
 			if start != noStart {
-				if err := f(p, name[start:i]); err != nil {
+				if err := f(state, name[start:i]); err != nil {
 					return err
 				}
 				start = noStart
@@ -41,7 +41,7 @@ func foreachIdent[TParameter any](p TParameter, name string, f func(TParameter, 
 		}
 	}
 	if start != noStart {
-		if err := f(p, name[start:]); err != nil {
+		if err := f(state, name[start:]); err != nil {
 			return err
 		}
 	}
@@ -66,9 +66,9 @@ func nameString(name string, nwt NameWriterTo) string {
 
 // NameWritersTo has a different NameWriterTo for each kind of object
 type NameWritersTo struct {
-	Schema NameWriterTo
-	Table  NameWriterTo
 	Column NameWriterTo
+	Table  NameWriterTo
+	Schema NameWriterTo
 }
 
 type snakeCase struct {
@@ -85,7 +85,8 @@ func (sc snakeCase) WriteNameTo(w io.Writer, name string) (int, error) {
 		sc snakeCase
 	}
 	d := data{w: w, bs: [...]byte{'_'}, sc: sc}
-	err := foreachIdent(&d, name, func(d *data, ident string) error {
+	err := foreachIdent(&d, name, func(anyData interface{}, ident string) error {
+		d := anyData.(*data)
 		if d.i > 0 {
 			n, err := d.w.Write(d.bs[:])
 			d.n += n
@@ -119,7 +120,8 @@ func (ow oneWord) WriteNameTo(w io.Writer, name string) (int, error) {
 		ow oneWord
 	}
 	d := data{sw: smallWriterOf(w), ow: ow}
-	err := foreachIdent(&d, name, func(d *data, ident string) error {
+	err := foreachIdent(&d, name, func(anyData interface{}, ident string) error {
+		d := anyData.(*data)
 		r, i := utf8.DecodeRuneInString(ident)
 		ident = ident[i:]
 		if d.i > 0 || (d.i == 0 && d.ow.capFirst) {

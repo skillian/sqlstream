@@ -9,40 +9,17 @@ import (
 
 // DBOption applies an option to the DB.
 type DBOption interface {
-	apply(db *DB) error
+	applyToDB(db *DB) error
+}
+
+// DBInfoOption applies an option to the DB.
+type DBInfoOption interface {
+	applyToDBInfo(dbi *DBInfo) error
 }
 
 var (
 	errRedef = errors.New("redefinition")
 )
-
-// WithDialect specifies the Dialect to use with the database
-func WithDialect(d Dialect) DBOption {
-	return dbOptionFunc(func(db *DB) error {
-		if db.dialect != nil {
-			return fmt.Errorf(
-				"%w of Dialect: %v to %v",
-				errRedef, db.dialect, d,
-			)
-		}
-		db.dialect = d
-		return nil
-	})
-}
-
-// WithDriver specifies the Driver to use with the database
-func WithDriver(d Driver) DBOption {
-	return dbOptionFunc(func(db *DB) error {
-		if db.driver != nil {
-			return fmt.Errorf(
-				"%w of Driver: %v to %v",
-				errRedef, db.driver, d,
-			)
-		}
-		db.driver = d
-		return nil
-	})
-}
 
 // WithSQLDB specifies the *sql.DB for the sqlstream.DB to wrap
 func WithSQLDB(sqlDB *sql.DB) DBOption {
@@ -85,8 +62,8 @@ func WithSQLOpenDB(c driver.Connector) DBOption {
 
 type dbOptionFunc func(*DB) error
 
-func (f dbOptionFunc) apply(db *DB) error { return f(db) }
+func (f dbOptionFunc) applyToDB(db *DB) error { return f(db) }
 
 type errDBOption struct{ err error }
 
-func (e errDBOption) apply(db *DB) error { return e.err }
+func (e errDBOption) applyToDB(db *DB) error { return e.err }

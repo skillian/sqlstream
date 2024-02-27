@@ -1,14 +1,14 @@
-package sqlstream_test
+package sqlstream
 
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/skillian/expr"
-	"github.com/skillian/sqlstream"
 	"github.com/skillian/sqlstream/sqllang"
 )
 
@@ -17,115 +17,72 @@ type selectTest struct {
 	odbc sqlWriterToExpect
 }
 
-var testDB = sqlstream.NewDB(
-	sqlstream.WithDriverDialect(sqlstream.ODBC),
-)
+type sqlWriterToExpect struct {
+	sql  string
+	args []interface{}
+}
+
+var testDB = func() *DB {
+	sqlDB, err := NewDB(
+		WithDriverDialect(ODBC),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return sqlDB
+}()
 
 type TestID struct {
 	Value int64
 }
 
 type Test struct {
-	TestID TestID
-	Name   string
+	TestID TestID `sqlstream:"test id,64"`
+	Name   string `sqlstream:"name,64"`
 }
 
 var selectTests = []selectTest{
 	{
 		node: func(ctx context.Context) sqllang.Node {
-			q := sqlstream.Query[Test](ctx, testDB)
-			m := sqlstream.ModelOf(&Test{})
+			t := &Test{}
+			q := testDB.Query(ctx, t)
 			return &sqllang.Select{
 				Columns: []sqllang.Column{
-					sqllang.Column{Expr: expr.MemOf(q.Var(), t, &t.TestID)},
-					sqllang.Column{Expr: expr.MemOf(q.Var(), t, &t.Name)},
+					{Expr: 456},
+					{Expr: expr.MemOf(q.Var(), t, &t.TestID)},
+					{Expr: expr.MemOf(q.Var(), t, &t.Name)},
 				},
 				From: sqllang.Source{
-					Table: _,
+					Table: "test",
+					Alias: "T0",
 				},
+				Where: sqllang.Where{
+					Expr: expr.Eq{
+						expr.MemOf(q, t, &t.TestID),
+						123,
+					},
+				},
+				OrderBy: []sqllang.Sort{
+					{By: expr.MemOf(q, t, &t.TestID), Desc: true},
+				},
+				Limit: big.NewInt(1),
 			}
 		},
 		odbc: sqlWriterToExpect{
-			sql:  "(? = ?)",
-			args: []interface{}{1, 1},
+			sql:  `SELECT TOP (1) ?, T0."TestID", T0."Name" FROM "test" WHERE T0."TestID" = ? ORDER BY T0."TestID" DESC;`,
+			args: []interface{}{456, 123},
 		},
 	},
-	{
-		expr: expr.Ne{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? <> ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Eq{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? = ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Lt{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? < ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Gt{2, 1},
-		odbc: sqlWriterToExpect{
-			sql:  "(? > ?)",
-			args: []interface{}{2, 1},
-		}},
-	{
-		expr: expr.Ge{3, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? >= ?)",
-			args: []interface{}{3, 2},
-		}},
-	{
-		expr: expr.Le{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? <= ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Add{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? + ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Sub{2, 1},
-		odbc: sqlWriterToExpect{
-			sql:  "(? - ?)",
-			args: []interface{}{2, 1},
-		}},
-	{
-		expr: expr.Mul{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? * ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Div{1, 2},
-		odbc: sqlWriterToExpect{
-			sql:  "(? / ?)",
-			args: []interface{}{1, 2},
-		}},
-	{
-		expr: expr.Eq{expr.Add{1, 2}, expr.Sub{3, expr.Mul{4, expr.Div{10, 2}}}},
-		odbc: sqlWriterToExpect{
-			sql:  "((? + ?) = (? - (? * (? / ?))))",
-			args: []interface{}{1, 2, 3, 4, 10, 2},
-		}},
 }
 
 func TestSelect(t *testing.T) {
-	testSQLWriterTo := func(ctx context.Context, t *testing.T, dd sqlstream.DriverDialect, e expr.Expr, expect *exprTestExpect) {
+	testSQLWriterTo := func(ctx context.Context, t *testing.T, dd DriverDialect, n sqllang.Node, expect *sqlWriterToExpect) {
 		sb := strings.Builder{}
-		swt, err := dd.SQLWriterTo(ctx)
+		swt, err := dd.SQLWriter(ctx, &sb)
 		if err != nil {
 			t.Fatal(err)
 		}
-		i64, err := swt.WriteSQLTo(ctx, &sb, e)
+		i64, err := swt.WriteSQL(ctx, n)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,11 +102,12 @@ func TestSelect(t *testing.T) {
 			)
 		}
 	}
-	for i := range exprTests {
-		tc := &exprTests[i]
-		t.Run(fmt.Sprint(tc.expr), func(t *testing.T) {
-			ctx := context.TODO()
-			testSQLWriterTo(ctx, t, sqlstream.ODBC, tc.expr, &tc.odbc)
+	ctx := context.TODO()
+	for i := range selectTests {
+		tc := &selectTests[i]
+		n := tc.node(ctx)
+		t.Run(fmt.Sprintf("selectTest[%d]", i), func(t *testing.T) {
+			testSQLWriterTo(ctx, t, ODBC, n, &tc.odbc)
 		})
 	}
 }

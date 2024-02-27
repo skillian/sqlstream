@@ -3,6 +3,7 @@ package sqlstream
 import (
 	"context"
 	"reflect"
+	"unsafe"
 
 	"github.com/skillian/errors"
 	"github.com/skillian/expr"
@@ -13,8 +14,9 @@ const (
 	Debug  = true
 	Unsafe = true
 
-	arbitraryCapacity = 8
-	tag               = "sqlstream"
+	arbitraryCapacity   = 8
+	maxInt64Base10Bytes = 20 // "-9223372036854775808"
+	tag                 = "sqlstream"
 )
 
 var (
@@ -61,3 +63,12 @@ func replaceArgs(ctx context.Context, args []interface{}) (replaced []interface{
 }
 
 type exprVar struct{ Var expr.Var }
+
+type ifaceData struct {
+	Type unsafe.Pointer
+	Data unsafe.Pointer
+}
+
+func ifaceDataOf(ptrToInterface unsafe.Pointer) *ifaceData {
+	return (*ifaceData)(ptrToInterface)
+}
