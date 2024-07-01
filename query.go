@@ -2,187 +2,344 @@ package sqlstream
 
 import (
 	"context"
-	"sync"
+	"database/sql"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/skillian/errors"
+	"github.com/skillian/ctxutil"
 	"github.com/skillian/expr"
 	"github.com/skillian/expr/stream"
+	"github.com/skillian/sqlstream/sqllang"
+	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 )
 
 type query interface {
-	source() query
+	expr.NamedVar
 	stream.Streamer
-	stream.Filterer
-	expr.Var
 }
 
-type queryCommon struct {
-	mu                   sync.Mutex
-	unsafeStreamer       stream.Streamer
-	streamerFactoryState interface{}
-	streamerFactoryFunc  func(context.Context, interface{}) stream.Streamer
+// queryComponent is a component of a query (e.g. a filter of a query,
+// a join, etc.)
+type queryComponent interface {
+	query
+	query() query
 }
 
-func (qc *queryCommon) init(state interface{}, fn func(context.Context, interface{}) stream.Streamer) {
-	qc.streamerFactoryState = state
-	qc.streamerFactoryFunc = fn
-}
-
-func (qc *queryCommon) getStreamer(ctx context.Context) stream.Streamer {
-	id := ifaceDataOf(unsafe.Pointer(&qc.unsafeStreamer))
-	for {
-		if atomic.LoadPointer(&id.Data) != nil {
-			return qc.unsafeStreamer
+func tableQueryOf(q query) (tq *tableQuery, hops int) {
+	for q != nil {
+		var ok bool
+		if tq, ok = q.(*tableQuery); ok {
+			return
 		}
-		sr := qc.streamerFactoryFunc(ctx, qc.streamerFactoryState)
-		srData := ifaceDataOf(unsafe.Pointer(&sr))
-		if atomic.CompareAndSwapPointer(
-			&id.Type,
-			nil,
-			srData.Type,
-		) {
-			atomic.StorePointer(
-				&id.Data,
-				srData.Data,
-			)
-			return qc.unsafeStreamer
-		}
+		q = q.(queryComponent).query()
+		hops++
 	}
-}
-
-type tableQuery struct {
-	queryCommon
-	db    *DB
-	table *table
-}
-
-func newTableQuery(db *DB, t *table) (tq *tableQuery) {
-	tq = &tableQuery{}
-	tq.init(db, t)
 	return
 }
 
-func (tq *tableQuery) init(db *DB, t *table) {
-	tq.queryCommon.init(tq, func(ctx context.Context, anyQuery interface{}) stream.Streamer {
-		tq := anyQuery.(*tableQuery)
-		return tq.db.queryStreamer(ctx, tq)
-	})
-	tq.db = db
-	tq.table = t
+func createQueryComponentName(qc queryComponent) string {
+	tq, hops := tableQueryOf(qc.query())
+	return fmt.Sprintf("%s_%d", tq.Name(), hops)
 }
 
-func tableQueryOf(q query) *tableQuery {
-	for q != nil {
-		if tq, ok := q.(*tableQuery); ok {
-			return tq
+// table defines the set of data needed for a query
+type table struct {
+	// db is the database the query was created from
+	db *DB
+
+	// modelType holds information about the Go struct that results
+	// from the query will be Scanned into
+	modelType *modelType
+
+	// sqlTable is the database table that the query comes from
+	sqlTable *sqlddl.Table
+}
+
+// tableQuery is a "root" query on a table
+type tableQuery struct {
+	table table
+
+	prepared preparedQuery
+
+	// name is the name ("alias") of the query
+	name string
+}
+
+type preparedQuery struct {
+	stmt             *sql.Stmt
+	args             []interface{}
+	preparer         sqlPreparer
+	prepareCountdown int32
+}
+
+func (pq *preparedQuery) executeQuery(ctx context.Context, q query, f func(*sql.Stmt, context.Context, ...interface{}) (*sql.Rows, error)) (stream.Stream, error) {
+	args, err := func() (args []interface{}, err error) {
+		var vs expr.Values
+		for i, arg := range pq.args {
+			if va, ok := arg.(expr.Var); ok {
+				if args == nil {
+					args = make([]interface{}, len(pq.args))
+					copy(args, pq.args[:i])
+				}
+				if vs == nil {
+					vs, err = expr.ValuesFromContext(ctx)
+					if err != nil {
+						return
+					}
+				}
+				args[i], err = vs.Get(ctx, va)
+				if err != nil {
+					return
+				}
+				continue
+			}
+			if args != nil {
+				args[i] = arg
+			}
 		}
-		q = q.source()
+		if args == nil {
+			args = pq.args
+		}
+		return
+	}()
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	var tq *tableQuery
+	preparer, ok := ctxutil.Value(ctx, (*sqlPreparer)(nil)).(sqlPreparer)
+	if !ok {
+		if tq == nil {
+			tq, _ = tableQueryOf(q)
+		}
+		preparer = tq.table.db.db
+	}
+	stmt := (*sql.Stmt)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&pq.stmt))))
+	if stmt != nil {
+		if pq.preparer != preparer {
+			if stmter, ok := preparer.(sqlStmter); ok {
+				stmt = stmter.StmtContext(ctx, stmt)
+			}
+		}
+		rows, err := f(stmt, ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		return pq.createStreamFromRows(rows)
+	}
+	if tq == nil {
+		tq, _ = tableQueryOf(q)
+	}
+	sn, err := pq.createSQLNodeFromQuery(ctx, q)
+	sb := strings.Builder{}
+	sw := smallWriterCounterOf(&sb)
+	sn, err := tq.table.db.sqlWriterTo.WriteSQLTo(ctx, sw, sn)
+
+	if atomic.AddInt32(&pq.prepareCountdown, -1) > 0 {
+		stmt, err = preparer.PrepareContext(ctx)
+	}
+}
+
+func (pq *preparedQuery) createSQLNodeFromQuery(ctx context.Context, q query) (sn sqllang.Node, err error) {
+	// get the query component chain into a slice and then iterate
+	// through it backwards (i.e. from the root *tableQuery to the
+	// last component) so that we can easily build the Select.
+	components := func() (components []query) {
+		components = make([]query, 0, arbitraryCapacity)
+		for {
+			components = append(components, q)
+			qc, ok := q.(queryComponent)
+			if !ok {
+				break
+			}
+			q = qc.query()
+		}
+		return
+	}()
+	sel := &sqllang.Select{}
+	for i := range components {
+		switch q := components[len(components)-i-1].(type) {
+		case *filterQuery:
+			if sel.Where.Expr == nil {
+				sel.Where.Expr = q.filter
+			} else {
+				sel.Where.Expr = expr.And{
+					sel.Where.Expr,
+					q.filter,
+				}
+			}
+		case *joinQuery:
+			sel.From.Joins = append(sel.From.Joins, sqllang.Join{})
+		case *mapQuery:
+			panic("// TODO: implement *mapQuery")
+		case *tableQuery:
+
+		}
+	}
+
+	sn = sel
+}
+
+func (pq *preparedQuery) createStreamFromRows(rows *sql.Rows) (stream.Stream, error) {
+
 }
 
 var _ interface {
 	query
 } = (*tableQuery)(nil)
 
-func (tq *tableQuery) Filter(ctx context.Context, e expr.Expr) (stream.Streamer, error) {
-	return newFilterQuery(tq, e), nil
-}
-
-func (q *tableQuery) Join(ctx context.Context, inner stream.Streamer, when, then expr.Expr) (stream.Streamer, error) {
-	if q2, ok := inner.(query); ok {
-		if db2 := tableQueryOf(q2).db; db2 != q.db {
-			return nil, errors.Errorf(
-				"%w: %v != %v",
-				errDBMismatch, q.db, db2,
-			)
-		}
-		return newJoinQuery(q, q2, when, then), nil
-	}
-	return stream.NewLocalJoiner(ctx, q, inner, when, then)
-}
+func (q *tableQuery) Name() string { return q.name }
 
 func (q *tableQuery) Stream(ctx context.Context) (stream.Stream, error) {
-	return q.queryCommon.getStreamer(ctx).Stream(ctx)
+	stmt := (*sql.Stmt)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&q.lazy.prepared))))
+	if stmt != nil {
+		preparer, ok := ctxutil.Value(ctx, (*sqlPreparer)(nil)).(sqlPreparer)
+		if !ok {
+			preparer = q.table.db.db
+		}
+		if preparer != q.lazy.preparer {
+
+		}
+	}
+	execer, ok := ctxutil.Value(ctx, (*sqlExecer)(nil)).(sqlExecer)
+	if !ok {
+		execer = q.table.db.db
+	}
 }
 
 func (q *tableQuery) Var() expr.Var { return q }
 
-func (q *tableQuery) source() query { return nil }
-
 type filterQuery struct {
-	queryCommon
-	from  query
-	where expr.Expr
-}
-
-func newFilterQuery(from query, where expr.Expr) (fq *filterQuery) {
-	fq = &filterQuery{}
-	fq.init(from, where)
-	return
-}
-
-func (fq *filterQuery) init(from query, where expr.Expr) {
-	fq.init(fq, func(ctx context.Context, anyQuery interface{}) stream.Streamer {
-		fq := anyQuery.(*filterQuery)
-		return tableQueryOf(fq).db.queryStreamer(ctx, fq)
-	})
-	fq.from = from
-	fq.where = where
-	return
+	from     query
+	prepared preparedQuery
+	filter   expr.Expr
+	name     atomicString
 }
 
 var _ interface {
 	query
+	queryComponent
 } = (*filterQuery)(nil)
 
-func (q *filterQuery) Filter(ctx context.Context, e expr.Expr) (stream.Streamer, error) {
-	return newFilterQuery(q, e), nil
+func (q *filterQuery) query() query { return q.from }
+func (q *filterQuery) Name() string {
+	return q.name.LoadOrCreate(q, func(arg interface{}) string {
+		return createQueryComponentName(arg.(queryComponent))
+	})
 }
-
 func (q *filterQuery) Stream(ctx context.Context) (stream.Stream, error) {
-	return q.queryCommon.getStreamer(ctx).Stream(ctx)
+	return q.prepared.executeQuery(ctx, q, (*sql.Stmt).QueryContext)
 }
-
 func (q *filterQuery) Var() expr.Var { return q.from.Var() }
 
-func (q *filterQuery) source() query { return q.from }
-
 type joinQuery struct {
-	queryCommon
-	from query
-	to   query
-	on   expr.Expr
-	proj expr.Expr
-}
-
-func newJoinQuery(from query, to query, on expr.Expr, proj expr.Expr) (jq *joinQuery) {
-	jq = &joinQuery{}
-	jq.init(from, to, on, proj)
-	return
-}
-
-func (jq *joinQuery) init(from query, to query, on expr.Expr, proj expr.Expr) {
-	jq.queryCommon.init(jq, func(ctx context.Context, anyQuery interface{}) stream.Streamer {
-		jq := anyQuery.(*joinQuery)
-		return tableQueryOf(jq).db.queryStreamer(ctx, jq)
-	})
+	from     query
+	prepared preparedQuery
+	to       query
+	on       expr.Expr
+	name     atomicString
 }
 
 var _ interface {
 	query
+	queryComponent
 } = (*joinQuery)(nil)
 
-func (q *joinQuery) Filter(ctx context.Context, e expr.Expr) (stream.Streamer, error) {
-	return newFilterQuery(q, e), nil
+func (q *joinQuery) query() query { return q.from }
+func (q *joinQuery) Name() string {
+	return q.name.LoadOrCreate(q, func(arg interface{}) string {
+		return createQueryComponentName(arg.(queryComponent))
+	})
 }
-
 func (q *joinQuery) Stream(ctx context.Context) (stream.Stream, error) {
-	return q.queryCommon.getStreamer(ctx).Stream(ctx)
+	return q.prepared.executeQuery(ctx, q, (*sql.Stmt).QueryContext)
+}
+func (q *joinQuery) Var() expr.Var { return q.Var() }
+
+type mapQuery struct {
+	from     query
+	prepared preparedQuery
+	mapping  expr.Expr
+	name     atomicString
 }
 
-func (q *joinQuery) Var() expr.Var { return q.from.Var() }
+var _ interface {
+	query
+	queryComponent
+} = (*mapQuery)(nil)
 
-func (q *joinQuery) source() query { return q.from }
+func (q *mapQuery) query() query { return q.from }
+func (q *mapQuery) Name() string {
+	return q.name.LoadOrCreate(q, func(arg interface{}) string {
+		return createQueryComponentName(arg.(queryComponent))
+	})
+}
+func (q *mapQuery) Stream(ctx context.Context) (stream.Stream, error) {
+	return q.prepared.executeQuery(ctx, q, (*sql.Stmt).QueryContext)
+}
+func (q *mapQuery) Var() expr.Var { return q }
+
+type sortQuery struct {
+	from       query
+	prepared   preparedQuery
+	sort       expr.Expr
+	name       atomicString
+	descending bool
+}
+
+var _ interface {
+	query
+	queryComponent
+} = (*sortQuery)(nil)
+
+func (q *sortQuery) query() query { return q.from }
+func (q *sortQuery) Name() string {
+	return q.name.LoadOrCreate(q, func(arg interface{}) string {
+		return createQueryComponentName(arg.(queryComponent))
+	})
+}
+func (q *sortQuery) Stream(ctx context.Context) (stream.Stream, error) {
+	return q.prepared.executeQuery(ctx, q, (*sql.Stmt).QueryContext)
+}
+func (q *sortQuery) Var() expr.Var { return q.from.Var() }
+
+func initSelect(sel *sqllang.Select, q query) error {
+	components := queryComponents(q)
+	for i := range components {
+		switch q := components[len(components)-i-1].(type) {
+		case *filterQuery:
+			if sel.Where.Expr == nil {
+				sel.Where.Expr = q.filter
+			} else {
+				sel.Where.Expr = expr.And{
+					sel.Where.Expr,
+					q.filter,
+				}
+			}
+		case *joinQuery:
+			sel.From.Joins = append(sel.From.Joins, sqllang.Join{
+				Source: sqllang.Source{
+					Select: &sqllang.Select{},
+				},
+			})
+		case *mapQuery:
+			panic("// TODO: implement *mapQuery")
+		case *tableQuery:
+
+		}
+	}
+}
+
+func queryComponents(q query) (components []query) {
+	components = make([]query, 0, arbitraryCapacity)
+	for {
+		components = append(components, q)
+		qc, ok := q.(queryComponent)
+		if !ok {
+			break
+		}
+		q = qc.query()
+	}
+	return
+}

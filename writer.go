@@ -16,58 +16,45 @@ func tryFlush(v interface{}) (flushed bool, err error) {
 	return
 }
 
-func unwrap(v interface{}, target interface{}) (isUnwrapped bool) {
-	const errorFormat = "unwrap(%#v, %#v): %s"
-	targetValue := reflect.ValueOf(target)
-	if !targetValue.IsValid() {
-		logger.Warn3(errorFormat, v, target, "target is not valid")
-		return false
-	}
-	if targetValue.Kind() != reflect.Ptr {
-		logger.Warn3(errorFormat, v, target, "target is not a pointer")
-		return false
-	}
-	if targetValue.IsNil() {
-		logger.Warn3(errorFormat, v, target, "target is nil")
-		return false
-	}
-	targetElementType := targetValue.Type().Elem()
-	valueValue := reflect.ValueOf(v)
-	for {
-		if !valueValue.IsValid() {
-			return false
-		}
-		if valueValue.Type().ConvertibleTo(targetElementType) {
-			targetValue.Elem().Set(valueValue.Convert(targetElementType))
-			return true
-		}
-		m, ok := valueValue.Type().MethodByName("Unwrap")
-		if !ok {
-			return false
-		}
-		if m.Type.NumIn() != 1 && m.Type.NumOut() != 1 {
-			return false
-		}
-		valueValue = m.Func.Call([]reflect.Value{valueValue})[0]
-	}
-}
+type RuneWriter interface{ WriteRune(rune) (int, error) }
 
-type runeWriter interface{ WriteRune(rune) (int, error) }
-
-// smallWriter extends io.Writer to provide useful methods for writing
+// SmallWriter extends io.Writer to provide useful methods for writing
 // small units of data.
-type smallWriter interface {
+type SmallWriter interface {
 	io.Writer
 	io.ByteWriter
-	runeWriter
+	RuneWriter
 	io.StringWriter
 }
 
-func smallWriterOf(w io.Writer) smallWriter {
-	if sw, ok := w.(smallWriter); ok {
+type smallWriterWrapper struct {
+	// Writer is the underlying writer that the smallWriter wraps.
+	w io.Writer
+
+	bw          io.ByteWriter
+	writeByte   func(*smallWriterWrapper, byte) error
+	sw          io.StringWriter
+	writeString func(*smallWriterWrapper, string) (int, error)
+	rw          RuneWriter
+	writeRune   func(*smallWriterWrapper, rune) (int, error)
+
+	// enc encodes runes into bytes that are written to Writer.
+	enc func([]byte, rune) int
+
+	buf [32]byte
+}
+
+func SmallWriterOf(w io.Writer) SmallWriter {
+	if sw, ok := w.(SmallWriter); ok {
 		return sw
 	}
-	sw := &smallWriterWrapper{w: w, enc: utf8.EncodeRune}
+	sw := &smallWriterWrapper{enc: utf8.EncodeRune}
+	sw.init(w)
+	return sw
+}
+
+func (sw *smallWriterWrapper) init(w io.Writer) {
+	sw.w = w
 	if unwrap(w, &sw.bw) {
 		sw.writeByte = func(sw *smallWriterWrapper, b byte) error {
 			return sw.bw.WriteByte(b)
@@ -110,24 +97,6 @@ func smallWriterOf(w io.Writer) smallWriter {
 			return sw.Write(bs)
 		}
 	}
-	return sw
-}
-
-type smallWriterWrapper struct {
-	// Writer is the underlying writer that the smallWriter wraps.
-	w io.Writer
-
-	bw          io.ByteWriter
-	writeByte   func(*smallWriterWrapper, byte) error
-	sw          io.StringWriter
-	writeString func(*smallWriterWrapper, string) (int, error)
-	rw          runeWriter
-	writeRune   func(*smallWriterWrapper, rune) (int, error)
-
-	// enc encodes runes into bytes that are written to Writer.
-	enc func([]byte, rune) int
-
-	buf [32]byte
 }
 
 func (sw *smallWriterWrapper) Unwrap() interface{} { return sw.w }
@@ -157,19 +126,19 @@ func (sw *smallWriterWrapper) WriteString(s string) (n int, err error) {
 }
 
 type smallWriterCounter struct {
-	smallWriter
-	written int64
+	smallWriter SmallWriter
+	written     int64
 }
 
 func smallWriterCounterOf(w io.Writer) *smallWriterCounter {
 	if swc, ok := w.(*smallWriterCounter); ok {
 		return swc
 	}
-	return &smallWriterCounter{smallWriter: smallWriterOf(w)}
+	return &smallWriterCounter{smallWriter: SmallWriterOf(w)}
 }
 
 var _ interface {
-	smallWriter
+	SmallWriter
 } = (*smallWriterCounter)(nil)
 
 func (sw *smallWriterCounter) Unwrap() interface{} { return sw.smallWriter }

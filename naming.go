@@ -114,12 +114,12 @@ type oneWord struct {
 
 func (ow oneWord) WriteNameTo(w io.Writer, name string) (int, error) {
 	type data struct {
-		sw smallWriter
+		sw SmallWriter
 		i  int
 		n  int
 		ow oneWord
 	}
-	d := data{sw: smallWriterOf(w), ow: ow}
+	d := data{sw: SmallWriterOf(w), ow: ow}
 	err := foreachIdent(&d, name, func(anyData interface{}, ident string) error {
 		d := anyData.(*data)
 		r, i := utf8.DecodeRuneInString(ident)
