@@ -1,13 +1,14 @@
 package sqlstream
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/skillian/expr/stream"
+	"github.com/skillian/sqlstream/sqllang"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 )
 
@@ -37,12 +38,35 @@ var _ = []interface {
 	(*sql.Tx)(nil),
 }
 
+type shouldPreparer interface {
+	shouldPrepare(context.Context, query) bool
+}
+
+type shouldPreparerFunc func(ctx context.Context, q query) bool
+
+func (f shouldPreparerFunc) shouldPrepare(ctx context.Context, q query) bool { return f(ctx, q) }
+
+type shouldPrepareAfterCount struct{ count int32 }
+
+func (sp shouldPrepareAfterCount) shouldPrepare(ctx context.Context, q query) bool {
+	if spr, ok := q.(interface{ preparedQuery() *preparedQuery }); ok {
+		pq := spr.preparedQuery()
+		// load w/o increment in so we don't roll over int32 in
+		// long-running processes
+		if atomic.LoadInt32(&pq.executionCount) >= sp.count {
+			return false // already prepared
+		}
+		return atomic.AddInt32(&pq.executionCount, 1) == sp.count
+	}
+	return false
+}
+
 type DB struct {
-	db               *sql.DB
-	sqlWriterTo      SQLWriterTo
-	nameWritersTo    NameWritersTo
-	sqlTables        sync.Map // map[*modelType]*sqlddl.Table
-	prepareCountdown int32
+	db             *sql.DB
+	sqlWriterTo    SQLWriterTo
+	nameWritersTo  NameWritersTo
+	sqlTables      sync.Map // map[*modelType]*sqlddl.Table
+	shouldPreparer shouldPreparer
 }
 
 type DBOption interface {
@@ -70,11 +94,8 @@ func NewDB(options ...DBOption) (*DB, error) {
 	if db.nameWritersTo.Schema == nil {
 		db.nameWritersTo.Schema = SnakeCaseLower
 	}
-	if db.prepareCountdown == 0 {
-		// 2:  First time, do not prepare, just execute the
-		// query.  Second time, prepare the query and execute
-		// it because it might be run a 3rd or more times.
-		db.prepareCountdown = 2
+	if db.shouldPreparer == nil {
+		db.shouldPreparer = shouldPrepareAfterCount{count: 2}
 	}
 	return db, nil
 }
@@ -97,30 +118,13 @@ func (db *DB) Query(ctx context.Context, modelType interface{}) stream.Streamer 
 }
 
 func (db *DB) sqlTableOf(mt *modelType) *sqlddl.Table {
-	createName := func(mt *modelType) (tn sqlddl.TableName) {
-		type selectorNameWriterTo struct {
-			fn  func(*sqlddl.TableName) *string
-			nwt NameWriterTo
-		}
-		b := bytes.Buffer{}
-		for _, snwt := range []selectorNameWriterTo{
-			selectorNameWriterTo{
-				func(x *sqlddl.TableName) *string { return &x.SchemaName.Name },
-				db.nameWritersTo.Schema,
-			},
-			selectorNameWriterTo{
-				func(x *sqlddl.TableName) *string { return &x.Name },
-				db.nameWritersTo.Table,
-			},
-		} {
-			dest := snwt.fn(&tn)
-			if *dest == "" {
-				if _, err := snwt.nwt.WriteNameTo(&b, *snwt.fn(&mt.rawName)); err != nil {
-					panic(err)
-				}
-				*dest = b.String()
-				b.Reset()
+	createName := func(rawName string, nwt NameWriterTo, sqlName *string) {
+		b := strings.Builder{}
+		if *sqlName == "" {
+			if _, err := nwt.WriteNameTo(&b, rawName); err != nil {
+				panic(err)
 			}
+			*sqlName = b.String()
 		}
 		return
 	}
@@ -131,20 +135,46 @@ func (db *DB) sqlTableOf(mt *modelType) *sqlddl.Table {
 			TableName: mt.sqlName,
 		}
 		if t.TableName == (sqlddl.TableName{}) {
-			t.TableName = createName(mt)
+			createName(
+				mt.rawName.SchemaName.Name,
+				db.nameWritersTo.Schema,
+				&t.TableName.SchemaName.Name,
+			)
+			createName(
+				mt.rawName.Name,
+				db.nameWritersTo.Table,
+				&t.TableName.Name,
+			)
 		}
-		b := bytes.Buffer{}
-		for i := range rsfs {
-			rsf := &rsfs[i]
-			t.Columns[i] = sqlddl.Column{
+		type argType struct {
+			db *DB
+			t  *sqlddl.Table
+		}
+		if err := mt.iterFields(&argType{
+			db: db,
+			t:  t,
+		}, func(f *modelTypeIterField) error {
+			arg := f.arg.(*argType)
+			c := &arg.t.Columns[f.index]
+			*c = sqlddl.Column{
 				ColumnName: sqlddl.ColumnName{
 					TableName: t.TableName,
+					Name:      f.sqlName,
 				},
+				Type: sqllang.TypeFromReflectType(f.reflectStructField.Type),
 			}
-			if tag, ok := rsf.Tag.Lookup(tagName); ok {
-				name, tag, ok := strings.Cut(tag)
+			if c.ColumnName.Name == "" {
+				createName(
+					f.rawName,
+					db.nameWritersTo.Column,
+					&c.ColumnName.Name,
+				)
 			}
+			return nil
+		}); err != nil {
+			panic(err)
 		}
+		return t
 	}
 	key := interface{}(mt)
 	if v, loaded := db.sqlTables.Load(key); loaded {
