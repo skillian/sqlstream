@@ -57,21 +57,11 @@ type table struct {
 	sqlTable *sqlddl.Table
 }
 
-// tableQuery is a "root" query on a table
-type tableQuery struct {
-	table table
-
-	prepared preparedQuery
-
-	// name is the name ("alias") of the query
-	name string
-}
-
 type preparedQuery struct {
-	stmt             *sql.Stmt
-	args             []interface{}
-	preparer         sqlPreparer
-	prepareCountdown int32
+	stmt           *sql.Stmt
+	args           []interface{}
+	preparer       sqlPreparer
+	executionCount int32
 }
 
 func (pq *preparedQuery) executeQuery(ctx context.Context, q query, f func(*sql.Stmt, context.Context, ...interface{}) (*sql.Rows, error)) (stream.Stream, error) {
@@ -185,6 +175,18 @@ func (pq *preparedQuery) createStreamFromRows(rows *sql.Rows) (stream.Stream, er
 
 }
 
+// tableQuery is a "root" query on a table
+type tableQuery struct {
+	table table
+
+	prepared preparedQuery
+
+	// name is the name ("alias") of the query
+	name string
+}
+
+func (q *tableQuery) preparedQuery() *preparedQuery { return &q.prepared }
+
 var _ interface {
 	query
 } = (*tableQuery)(nil)
@@ -222,6 +224,8 @@ var _ interface {
 	queryComponent
 } = (*filterQuery)(nil)
 
+func (q *filterQuery) preparedQuery() *preparedQuery { return &q.prepared }
+
 func (q *filterQuery) query() query { return q.from }
 func (q *filterQuery) Name() string {
 	return q.name.LoadOrCreate(q, func(arg interface{}) string {
@@ -246,6 +250,8 @@ var _ interface {
 	queryComponent
 } = (*joinQuery)(nil)
 
+func (q *joinQuery) preparedQuery() *preparedQuery { return &q.prepared }
+
 func (q *joinQuery) query() query { return q.from }
 func (q *joinQuery) Name() string {
 	return q.name.LoadOrCreate(q, func(arg interface{}) string {
@@ -268,6 +274,8 @@ var _ interface {
 	query
 	queryComponent
 } = (*mapQuery)(nil)
+
+func (q *mapQuery) preparedQuery() *preparedQuery { return &q.prepared }
 
 func (q *mapQuery) query() query { return q.from }
 func (q *mapQuery) Name() string {
@@ -292,6 +300,8 @@ var _ interface {
 	query
 	queryComponent
 } = (*sortQuery)(nil)
+
+func (q *sortQuery) preparedQuery() *preparedQuery { return &q.prepared }
 
 func (q *sortQuery) query() query { return q.from }
 func (q *sortQuery) Name() string {
