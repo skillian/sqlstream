@@ -21,12 +21,24 @@ type Type interface {
 // TypeOf gets a default type for a given value
 func TypeOf(v interface{}) Type {
 	rt := reflect.TypeOf(v)
+	return TypeFromReflectType(rt)
+}
+
+// TypeFromReflectType gets the sqllang Type of a reflect.Type
+func TypeFromReflectType(rt reflect.Type) Type {
+	return typeFromReflectType(rt, 0)
+}
+
+func typeFromReflectType(rt reflect.Type, depth int) Type {
 	if st, ok := typeLookups.reflectTypeToSQLType[rt]; ok {
 		return st
 	}
 	switch rt.Kind() {
 	case reflect.Pointer:
-		return Nullable{TypeOf(reflect.Zero(rt.Elem()).Interface())}
+		if depth >= 1 {
+			panic("double-pointer or more not supported")
+		}
+		return Nullable{typeFromReflectType(rt.Elem(), depth+1)}
 	}
 	return NullBinaryType
 }
@@ -236,19 +248,34 @@ func (t Int) ReflectType() reflect.Type {
 	return bigIntType
 }
 
+type StringFlags uint8
+
+const (
+	fixedBit = iota
+	wideBit
+	maxBit
+)
+
 // String is an alphanumeric type
 type String struct {
-	// Length is the maximum length of the string that can be stored
-	// without truncating.
-	Length uint
-
-	// Fixed indicates if the column is fixed width.  When false,
-	// the string length is variable.
-	Fixed bool
+	// data's bottom `maxBit` number of bits hold flags.  The rest
+	// are the length.
+	data uint64
 }
 
 func (t String) New() interface{}          { return new(string) }
 func (t String) ReflectType() reflect.Type { return stringType }
+
+// Fixed indicates if the column is fixed width.  When false,
+// the string length is variable.
+func (t String) Fixed() bool { return t.data&(1<<fixedBit) != 0 }
+
+// Len gets the maximum bytes the string can hold
+func (t String) Len() int64 { return int64(t.data >> maxBit) }
+
+// Wide indicates if the data type uses "wide" characters in the
+// database implementation
+func (t String) Wide() bool { return t.data&(1<<wideBit) != 0 }
 
 // Time is a time type
 type Time struct {
