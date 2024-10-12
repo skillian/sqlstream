@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 
 	"github.com/skillian/expr/stream"
-	"github.com/skillian/sqlstream/sqllang"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 )
 
@@ -49,8 +48,8 @@ func (f shouldPreparerFunc) shouldPrepare(ctx context.Context, q query) bool { r
 type shouldPrepareAfterCount struct{ count int32 }
 
 func (sp shouldPrepareAfterCount) shouldPrepare(ctx context.Context, q query) bool {
-	if spr, ok := q.(interface{ preparedQuery() *preparedQuery }); ok {
-		pq := spr.preparedQuery()
+	if pqr, ok := q.(interface{ preparedQuery() *preparedQuery }); ok {
+		pq := pqr.preparedQuery()
 		// load w/o increment in so we don't roll over int32 in
 		// long-running processes
 		if atomic.LoadInt32(&pq.executionCount) >= sp.count {
@@ -63,6 +62,8 @@ func (sp shouldPrepareAfterCount) shouldPrepare(ctx context.Context, q query) bo
 
 type DB struct {
 	db             *sql.DB
+	argWriterTo    ArgWriterTo
+	exprWriterTo   ExprWriterTo
 	sqlWriterTo    SQLWriterTo
 	nameWritersTo  NameWritersTo
 	sqlTables      sync.Map // map[*modelType]*sqlddl.Table
@@ -161,7 +162,7 @@ func (db *DB) sqlTableOf(mt *modelType) *sqlddl.Table {
 					TableName: t.TableName,
 					Name:      f.sqlName,
 				},
-				Type: sqllang.TypeFromReflectType(f.reflectStructField.Type),
+				Type: f.sqlType,
 			}
 			if c.ColumnName.Name == "" {
 				createName(

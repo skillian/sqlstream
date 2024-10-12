@@ -1,6 +1,7 @@
 package sqlstream
 
 import (
+	"fmt"
 	"math/bits"
 	"reflect"
 	"strings"
@@ -12,9 +13,11 @@ import (
 	"github.com/skillian/sqlstream/sqllang"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 	"github.com/skillian/unsafereflect"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
-// modelType holds sqlstream-specific data associated with
+// modelType holds sqlstream-specific data associated with models
 type modelType struct {
 	unsafereflectType *unsafereflect.Type
 
@@ -27,7 +30,7 @@ type modelType struct {
 	// flatFieldIndexes[:2*len(flatFieldIndexes)] is a sequence
 	// of pairs of field indexes.
 	//
-	// flatFieldIndexes[:2*len(flatFieldIndexes):cap(flatFieldIndexes)]
+	// flatFieldIndexes[2*len(flatFieldIndexes):cap(flatFieldIndexes)]
 	// are the ranges of fields.
 	//
 	// So:
@@ -47,10 +50,6 @@ type modelType struct {
 
 	structFields []reflect.StructField
 
-	// names[0] is the model's "raw" name
-	// names[1:len(names)] are all the columns' "raw" names
-	// names[len(names)] is the model's SQL name
-	// names[len(names)+1:cap(names)] are all the columns' SQL names
 	rawName sqlddl.TableName
 	sqlName sqlddl.TableName
 
@@ -73,7 +72,7 @@ func modelTypeOf(v interface{}) *modelType {
 		logger.Warn2(
 			"expected %v(value), not %[1]v(%v)",
 			errutil.Caller(0).FuncName,
-			reflect.TypeOf(&v2).Elem(),
+			v,
 		)
 		return modelTypeOfReflectType(v2)
 	}
@@ -101,14 +100,14 @@ func splitGoName(name string, arg interface{}, fn func(arg interface{}, part str
 	return splitGoNameNoAcronyms(name, &wrapped, func(arg interface{}, part string) error {
 		wrapped := arg.(*wrappedArg)
 		r, n := utf8.DecodeRuneInString(part)
-		if len(part) == n && unicode.IsUpper(r) {
+		if len(part) == n /* is single "letter" */ && unicode.IsUpper(r) {
 			wrapped.buf = utf8.AppendRune(wrapped.buf, r)
 			return nil
 		}
 		if len(wrapped.buf) > 0 {
-			temp := string(wrapped.buf)
+			err := wrapped.fn(wrapped.arg, string(wrapped.buf))
 			wrapped.buf = wrapped.buf[:0]
-			if err := wrapped.fn(wrapped.arg, temp); err != nil {
+			if err != nil {
 				return err
 			}
 		}
@@ -143,8 +142,14 @@ func splitGoNameNoAcronyms(name string, arg interface{}, fn func(arg interface{}
 }
 
 func modelTypeOfReflectType(rt reflect.Type) *modelType {
-	for rt.Kind() == reflect.Pointer {
+	if rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
+	}
+	if rt.Kind() == reflect.Pointer {
+		panic(fmt.Sprintf(
+			"cannot create model type from pointer to: %v",
+			rt.Name(),
+		))
 	}
 	parseNameFromTag := func(t reflect.StructTag) (rawName, sqlName, after string, ok bool) {
 		after, ok = t.Lookup(tagName)
@@ -159,7 +164,12 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 		return
 	}
 	createModelType := func(rt reflect.Type) (mt *modelType) {
+		// make sure pointer-to-model type is initialized:
+		_ = unsafereflect.TypeFromReflectType(reflect.PtrTo(rt))
 		urt := unsafereflect.TypeFromReflectType(rt)
+		mt = &modelType{
+			unsafereflectType: urt,
+		}
 		sfs := urt.ReflectStructFields()
 		fieldIndexes := make([][2]int, 0, 2<<bits.Len(uint(len(sfs))))
 		flatFieldIndexes := make([]int, 0, cap(fieldIndexes)*cap(fieldIndexes)/2)
@@ -198,7 +208,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 						fieldIndexes,
 						[2]int{
 							ffStartIndex,
-							len(flatFieldIndexes),
+							ffStartIndex + len(flatFieldIndexes),
 						},
 					)
 					structFields = append(structFields, *f.reflectStructField)
@@ -220,7 +230,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 					typeName, after, ok = strings.Cut(after, ",")
 					if len(typeName) > 0 {
 						var err error
-						columnType, err = ParseTypeName(typeName)
+						columnType, err = sqllang.ParseTypeName(typeName)
 						if err != nil {
 							panic(err)
 						}
@@ -271,6 +281,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 		}
 		mt.columnTypes = make([]sqllang.Type, len(columnTypes))
 		copy(mt.columnTypes, columnTypes)
+		logger.Verbose1("%v", spew.Sdump(mt))
 		return
 	}
 	key := interface{}(rt)
@@ -296,13 +307,15 @@ func (mt *modelType) AppendUnsafeFieldValues(args []interface{}, v interface{}) 
 func (mt *modelType) ReflectStructFields() []reflect.StructField { return mt.structFields }
 
 func (mt *modelType) appendFields(args []interface{}, v interface{}, f func(*unsafereflect.Type, interface{}, int) interface{}) []interface{} {
-	_ = mt.iterFields(nil, func(
-		mtif *modelTypeIterField,
-	) error {
+	_ = mt.iterFields(v, func(mtif *modelTypeIterField) error {
+		v := mtif.arg
+		for i, urt := range mtif.unsafereflectTypePath[:len(mtif.unsafereflectTypePath)-1] {
+			v = urt.UnsafeFieldValue(v, mtif.fieldIndex[i])
+		}
 		args = append(
 			args,
 			f(
-				mtif.unsafereflectType,
+				mtif.unsafereflectTypePath[len(mtif.unsafereflectTypePath)-1],
 				v,
 				mtif.fieldIndex[len(mtif.fieldIndex)-1],
 			),
@@ -313,37 +326,52 @@ func (mt *modelType) appendFields(args []interface{}, v interface{}, f func(*uns
 }
 
 type modelTypeIterField struct {
-	arg                interface{}
-	unsafereflectType  *unsafereflect.Type
-	index              int
-	fieldIndex         []int
-	reflectStructField *reflect.StructField
-	rawName            string
-	sqlName            string
-	sqlType            sqllang.Type
+	// arg passed to iterFields
+	arg interface{}
+
+	// unsafereflectTypePath is the sequence of
+	unsafereflectTypePath []*unsafereflect.Type
+	index                 int
+	fieldIndex            []int
+	reflectStructField    *reflect.StructField
+	rawName               string
+	sqlName               string
+	sqlType               sqllang.Type
 }
 
-func (mt *modelType) iterFields(arg interface{}, f func(f *modelTypeIterField) error) error {
+func (mt *modelType) iterFields(arg interface{}, eachField func(f *modelTypeIterField) error) error {
+	type modelTypeIterFieldWithCache struct {
+		modelTypeIterField
+		unsafereflectTypePathCache [arbitraryCapacity]*unsafereflect.Type
+	}
+	mtifwc := modelTypeIterFieldWithCache{
+		modelTypeIterField: modelTypeIterField{
+			arg: arg,
+		},
+	}
+	mtifwc.modelTypeIterField.unsafereflectTypePath = mtifwc.unsafereflectTypePathCache[:1]
+	mtif := &mtifwc.modelTypeIterField
+	mtif.unsafereflectTypePath[0] = mt.unsafereflectType
 	len2 := len(mt.flatFieldIndexes) * 2
 	fieldIndexPairs := mt.flatFieldIndexes[:len2]
 	allFieldIndexes := mt.flatFieldIndexes[len2:cap(mt.flatFieldIndexes)]
-	mtif := modelTypeIterField{
-		arg: arg,
-	}
 	for mtif.index = range mt.flatFieldIndexes {
 		i := mtif.index * 2
 		mtif.fieldIndex = allFieldIndexes[fieldIndexPairs[i]:fieldIndexPairs[i+1]]
 		{
-			mtif.unsafereflectType = mt.unsafereflectType
+			mtif.unsafereflectTypePath = mtif.unsafereflectTypePath[:1]
 			for _, j := range mtif.fieldIndex[:len(mtif.fieldIndex)-1] {
-				mtif.unsafereflectType = mtif.unsafereflectType.FieldType(j)
+				mtif.unsafereflectTypePath = append(
+					mtif.unsafereflectTypePath,
+					mtif.unsafereflectTypePath[len(mtif.unsafereflectTypePath)-1].FieldType(j),
+				)
 			}
 		}
 		mtif.reflectStructField = &mt.unsafereflectType.ReflectStructFields()[mtif.fieldIndex[len(mtif.fieldIndex)-1]]
 		mtif.rawName = mt.columnNames[mtif.index]
 		mtif.sqlName = mt.columnNames[:cap(mt.columnNames)][len(mt.columnNames)+mtif.index]
 		mtif.sqlType = mt.columnTypes[mtif.index]
-		if err := f(&mtif); err != nil {
+		if err := eachField(mtif); err != nil {
 			return err
 		}
 	}

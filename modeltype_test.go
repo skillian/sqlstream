@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/skillian/logging"
 )
 
 type testThingID struct {
@@ -16,6 +18,7 @@ type testThing struct {
 }
 
 func TestModelType(t *testing.T) {
+	defer logging.TestingHandler(logger, t, logging.HandlerLevel(logging.VerboseLevel))()
 	th := &testThing{
 		ThingID:   testThingID{Value: 123},
 		ThingName: "testThingName",
@@ -38,5 +41,29 @@ func assert(t *testing.T, result bool, repr string, args ...interface{}) {
 		sb.WriteString("assertion failed: ")
 		fmt.Fprintf(&sb, repr, args...)
 		t.Fatal(sb.String())
+	}
+}
+
+func TestGoSplitName(t *testing.T) {
+	parts := new([]string)
+	err := splitGoName("HTTPServer", parts, func(arg interface{}, part string) error {
+		parts := arg.(*[]string)
+		*parts = append(*parts, part)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*parts) != 2 {
+		t.Fatalf(
+			"expected length %v, actual %v",
+			2, len(*parts),
+		)
+	}
+	if (*parts)[0] != "HTTP" {
+		t.Fatal("expected first part to be 'HTTP'")
+	}
+	if (*parts)[1] != "Server" {
+		t.Fatal("expected first part to be 'Server'")
 	}
 }

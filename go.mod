@@ -2,7 +2,10 @@ module github.com/skillian/sqlstream
 
 go 1.17
 
-require github.com/skillian/ctxutil v0.0.0 // indirect
+require (
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/skillian/ctxutil v0.0.0 // indirect
+)
 
 require github.com/skillian/expr v0.0.0
 
@@ -16,6 +19,8 @@ require (
 require github.com/skillian/unsafereflect v0.0.0
 
 replace github.com/skillian/ctxutil => ../ctxutil
+
+replace github.com/skillian/errors => ../errors
 
 replace github.com/skillian/errutil => ../errutil
 

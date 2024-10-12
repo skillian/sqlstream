@@ -1,3 +1,5 @@
+github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/skillian/errors v0.0.0-20190910214200-f19f31b303bd/go.mod h1:CL0Om+OM8cojqqD6QFte4PFCOS/aJKmdTT7ydYfA43I=
 github.com/skillian/errors v0.0.0-20220412220440-9e3e39f14923 h1:XrMdajUGU60etx+9mEiVbjpXdvre6IZfdhPAlxMkFoo=
 github.com/skillian/errors v0.0.0-20220412220440-9e3e39f14923/go.mod h1:kX8qF4s/RSAES+rX81X5QRoMExJ7V2rdoWyF9wjNoJg=
