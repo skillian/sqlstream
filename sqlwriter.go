@@ -2,7 +2,6 @@ package sqlstream
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -94,142 +93,72 @@ type SQLWriter interface {
 // sqlWriter is the default SQLWriter implementation that uses
 // an ArgWriterTo, ExprWriterTo, and SQLWriterTo to generate SQL.
 type sqlWriter struct {
-	w            smallWriterCounter
-	argWriterTo  ArgWriterTo
-	exprWriterTo ExprWriterTo
-	sqlWriterTo  SQLWriterTo
-	args         []interface{}
+	w      smallWriterCounter
+	dbInfo *DBInfo
+	args   []interface{}
 }
 
 var _ interface {
 	SQLWriter
 } = (*sqlWriter)(nil)
 
-func (sw *sqlWriter) init(w io.Writer) {
+func (sw *sqlWriter) init(dbi *DBInfo, w io.Writer) {
+	sw.dbInfo = dbi
 	sw.w.smallWriter = SmallWriterOf(w)
 }
 
-type SQLWriterOption interface {
-	applyOptionToSQLWriter(*sqlWriter) error
-}
+//type sqlWriterOptionFunc func(*sqlWriter) error
 
-type sqlWriterOptionFunc func(*sqlWriter) error
-
-func (f sqlWriterOptionFunc) applyOptionToSQLWriter(sw *sqlWriter) error {
-	return f(sw)
-}
-
-var (
-	errNoArgWriterTo  = errors.New(fmt.Sprintf("missing %v", reflect.TypeOf((*ArgWriterTo)(nil)).Elem().Name()))
-	errNoExprWriterTo = errors.New(fmt.Sprintf("missing %v", reflect.TypeOf((*ExprWriterTo)(nil)).Elem().Name()))
-	errNoSQLWriterTo  = errors.New(fmt.Sprintf("missing %v", reflect.TypeOf((*SQLWriterTo)(nil)).Elem().Name()))
-)
-
-// MakeSQLWriter creates a SQLWriter from the given io.Writer and
-// options.
-func MakeSQLWriter(ctx context.Context, w io.Writer, options ...SQLWriterOption) (SQLWriter, error) {
-	if sw, ok := w.(SQLWriter); ok {
-		return sw, nil
-	}
-	sw := &sqlWriter{}
-	sw.init(w)
-	for _, opt := range options {
-		if err := opt.applyOptionToSQLWriter(sw); err != nil {
-			return nil, err
-		}
-	}
-	// TODO: Set defaults?
-	if sw.argWriterTo == nil {
-		sw.argWriterTo = odbcArgWriterTo{}
-	}
-	if sw.exprWriterTo == nil {
-		sw.exprWriterTo = defaultExprWriterTo{}
-	}
-	if sw.sqlWriterTo == nil {
-		sw.sqlWriterTo = defaultSQLWriterTo{}
-	}
-	return sw, nil
-}
+// func (f sqlWriterOptionFunc) applyOptionToSQLWriter(sw *sqlWriter) error {
+// 	return f(sw)
+// }
 
 // WithArgWriterTo configures the argument writer for a DB or SQLWriter
 func WithArgWriterTo(awt ArgWriterTo) interface {
 	DBOption
-	SQLWriterOption
+	DBInfoOption
 } {
-	return setArgWriterTo{awt}
-}
-
-type setArgWriterTo struct {
-	argWriterTo ArgWriterTo
-}
-
-func (sawt setArgWriterTo) applyOptionToDB(db *DB) error {
-	db.argWriterTo = sawt.argWriterTo
-	return nil
-}
-
-func (sawt setArgWriterTo) applyOptionToSQLWriter(sw *sqlWriter) error {
-	sw.argWriterTo = sawt.argWriterTo
-	return nil
+	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+		dbi.ArgWriterTo = awt
+		return nil
+	})
 }
 
 // WithExprWriterTo configures the argument writer for a DB or SQLWriter
 func WithExprWriterTo(ewt ExprWriterTo) interface {
 	DBOption
-	SQLWriterOption
+	DBInfoOption
 } {
-	return setExprWriterTo{ewt}
-}
-
-type setExprWriterTo struct {
-	exprWriterTo ExprWriterTo
-}
-
-func (sewt setExprWriterTo) applyOptionToDB(db *DB) error {
-	db.exprWriterTo = sewt.exprWriterTo
-	return nil
-}
-
-func (sewt setExprWriterTo) applyOptionToSQLWriter(sw *sqlWriter) error {
-	sw.exprWriterTo = sewt.exprWriterTo
-	return nil
+	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+		dbi.ExprWriterTo = ewt
+		return nil
+	})
 }
 
 // WithSQLWriterTo configures the argument writer for a DB or SQLWriter
 func WithSQLWriterTo(swt SQLWriterTo) interface {
 	DBOption
-	SQLWriterOption
+	DBInfoOption
 } {
-	return setSQLWriterTo{swt}
-}
-
-type setSQLWriterTo struct {
-	sqlWriterTo SQLWriterTo
-}
-
-func (sswt setSQLWriterTo) applyOptionToDB(db *DB) error {
-	db.sqlWriterTo = sswt.sqlWriterTo
-	return nil
-}
-
-func (sswt setSQLWriterTo) applyOptionToSQLWriter(sw *sqlWriter) error {
-	sw.sqlWriterTo = sswt.sqlWriterTo
-	return nil
+	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+		dbi.SQLWriterTo = swt
+		return nil
+	})
 }
 
 func (sw *sqlWriter) Args() []interface{} { return sw.args }
 
 func (sw *sqlWriter) WriteArg(ctx context.Context, arg interface{}) (n int64, err error) {
-	sw.args, n, err = sw.argWriterTo.WriteArgTo(ctx, &sw.w, sw.args, arg)
+	sw.args, n, err = sw.dbInfo.ArgWriterTo.WriteArgTo(ctx, &sw.w, sw.args, arg)
 	return
 }
 
 func (sw *sqlWriter) WriteExpr(ctx context.Context, e expr.Expr) (n int64, err error) {
-	sw.args, n, err = sw.exprWriterTo.WriteExprTo(
+	sw.args, n, err = sw.dbInfo.ExprWriterTo.WriteExprTo(
 		ctx,
 		&sw.w,
-		sw.sqlWriterTo,
-		sw.argWriterTo,
+		sw.dbInfo.SQLWriterTo,
+		sw.dbInfo.ArgWriterTo,
 		sw.args,
 		e,
 	)
@@ -237,11 +166,11 @@ func (sw *sqlWriter) WriteExpr(ctx context.Context, e expr.Expr) (n int64, err e
 }
 
 func (sw *sqlWriter) WriteSQL(ctx context.Context, s sqllang.Node) (n int64, err error) {
-	sw.args, n, err = sw.sqlWriterTo.WriteSQLTo(
+	sw.args, n, err = sw.dbInfo.SQLWriterTo.WriteSQLTo(
 		ctx,
 		&sw.w,
-		sw.exprWriterTo,
-		sw.argWriterTo,
+		sw.dbInfo.ExprWriterTo,
+		sw.dbInfo.ArgWriterTo,
 		sw.args,
 		s,
 	)
@@ -296,7 +225,6 @@ type defaultExprWriterVisitor struct {
 	sqlWriterTo SQLWriterTo
 	args        []interface{}
 	stack       []defaultExprWriterVisitorFrame
-	queries     []query
 }
 
 var _ expr.Visitor = (*defaultExprWriterVisitor)(nil)
@@ -307,7 +235,7 @@ func (vis *defaultExprWriterVisitor) Visit(ctx context.Context, e expr.Expr) (v2
 		top := &vis.stack[len(vis.stack)-1]
 		top.e = e
 		sec := &vis.stack[len(vis.stack)-2]
-		if sec.e != nil && precedenceOf(sec.e) > precedenceOf(top.e) {
+		if sec.e != nil && precedenceOf(sec.e) < precedenceOf(top.e) {
 			if err = vis.w.WriteByte('('); err != nil {
 				return nil, err
 			}
@@ -348,10 +276,17 @@ func (vis *defaultExprWriterVisitor) Visit(ctx context.Context, e expr.Expr) (v2
 	}
 	top := &vis.stack[len(vis.stack)-1]
 	e = top.e
-	if _, err = vis.w.WriteString(top.infix); err != nil {
-		return nil, err
+	sec := &vis.stack[len(vis.stack)-2]
+	defaultCase := func(e expr.Expr) error {
+		vis.args, _, err = vis.argWriterTo.WriteArgTo(ctx, vis.w, vis.args, e)
+		if err != nil {
+			return fmt.Errorf(
+				"visiting arg %#v: %w",
+				e, err,
+			)
+		}
+		return nil
 	}
-	top.infix = ""
 	switch e := e.(type) {
 	case query:
 		name := e.Name()
@@ -369,21 +304,75 @@ func (vis *defaultExprWriterVisitor) Visit(ctx context.Context, e expr.Expr) (v2
 				e, err,
 			)
 		}
+	case *reflect.StructField:
+		if mem, ok := sec.e.(expr.Mem); ok {
+			q, ok := mem[0].(query)
+			if !ok {
+				return nil, fmt.Errorf(
+					"cannot get member of non-query: %v (type: %[1]T)",
+					mem[0],
+				)
+			}
+			tq, _ := tableQueryOf(q)
+			mt := tq.table.modelType
+			fieldIndex := func() int {
+				for i := range mt.structFields {
+					for _, fp := range mt.structFields[i].urFieldPath {
+						if &fp.urType.ReflectStructFields()[fp.fieldIndex] == e {
+							return i
+						}
+					}
+				}
+				return -1
+			}()
+			if fieldIndex == -1 {
+				return nil, fmt.Errorf(
+					"failed to find member %v of %v",
+					e.Name,
+					tq.table.modelType.unsafereflectType.ReflectType().Name(),
+				)
+			}
+			colName := tq.table.sqlTable.Columns[fieldIndex].ColumnName.Name
+			if err := vis.w.WriteByte('"'); err != nil {
+				return nil, fmt.Errorf(
+					"writing quote before column %v: %w",
+					colName, err,
+				)
+			}
+			if _, err := vis.w.WriteString(colName); err != nil {
+				return nil, fmt.Errorf(
+					"writing column %v name: %w",
+					colName, err,
+				)
+			}
+			if err := vis.w.WriteByte('"'); err != nil {
+				return nil, fmt.Errorf(
+					"writing quote after column %v: %w",
+					colName, err,
+				)
+			}
+		} else if err := defaultCase(e); err != nil {
+			return nil, err
+		}
+	case expr.Unary:
+	case expr.Binary:
+	case interface{ Operands() []expr.Expr }:
+		// pass
 	default:
-		vis.args, _, err = vis.argWriterTo.WriteArgTo(ctx, vis.w, vis.args, e)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"visiting arg %#v: %w",
-				e, err,
-			)
+		if err := defaultCase(e); err != nil {
+			return nil, err
 		}
 	}
-	sec := &vis.stack[len(vis.stack)-2]
-	if sec.e != nil && precedenceOf(sec.e) > precedenceOf(top.e) {
+	if _, err = vis.w.WriteString(sec.infix); err != nil {
+		return nil, err
+	}
+	sec.infix = ""
+	if sec.e != nil && precedenceOf(sec.e) < precedenceOf(top.e) {
 		if err = vis.w.WriteByte(')'); err != nil {
 			return nil, err
 		}
 	}
+	vis.stack = vis.stack[:len(vis.stack)-1]
 	return
 }
 
@@ -391,11 +380,11 @@ var precedences = func() (precedences [][]reflect.Type) {
 	precedencePtrsTo := [][]interface{}{
 		// It seems SQL doesn't treat . as an operator, so I'll
 		// just put it at the highest precedence
-		[]interface{}{(*expr.Mem)(nil)},
+		//{(*expr.Mem)(nil)},
 		// TODO: expr.Neg
-		[]interface{}{(*expr.Mul)(nil), (*expr.Div)(nil) /* TODO: expr.Mod */},
-		[]interface{}{(*expr.Add)(nil), (*expr.Sub)(nil) /* TODO: Bitwise */},
-		[]interface{}{
+		{(*expr.Mul)(nil), (*expr.Div)(nil) /* TODO: expr.Mod */},
+		{(*expr.Add)(nil), (*expr.Sub)(nil) /* TODO: Bitwise */},
+		{
 			// Comparison operators
 			(*expr.Eq)(nil),
 			(*expr.Ne)(nil),
@@ -404,9 +393,9 @@ var precedences = func() (precedences [][]reflect.Type) {
 			(*expr.Lt)(nil),
 			(*expr.Le)(nil),
 		},
-		[]interface{}{(*expr.Not)(nil)},
-		[]interface{}{(*expr.And)(nil)},
-		[]interface{}{(*expr.Or)(nil)},
+		{(*expr.Not)(nil)},
+		{(*expr.And)(nil)},
+		{(*expr.Or)(nil)},
 		/* ALL, ANY, BETWEEN, IN, LIKE, OR, SOME */
 	}
 	precedences = make([][]reflect.Type, len(precedencePtrsTo))
@@ -448,7 +437,7 @@ type defaultSQLWriterTo struct{}
 
 var _ SQLWriterTo = defaultSQLWriterTo{}
 
-func (defaultSQLWriterTo) WriteSQLTo(
+func (swt defaultSQLWriterTo) WriteSQLTo(
 	ctx context.Context,
 	w SmallWriter,
 	ewt ExprWriterTo,
@@ -466,7 +455,7 @@ func (defaultSQLWriterTo) WriteSQLTo(
 		w:            swc,
 		argWriterTo:  awt,
 		exprWriterTo: ewt,
-		sqlWriterTo:  defaultSQLWriterTo{},
+		sqlWriterTo:  swt,
 		args:         currentArgs,
 	}
 	err = sqllang.Walk(ctx, node, v)
@@ -496,15 +485,16 @@ func (vis *defaultSQLWriterVisitor) Visit(ctx context.Context, node sqllang.Node
 	}
 	switch node := node.(type) {
 	case *sqllang.Select:
-		if entering && len(vis.stack) > 1 {
-			if err := vis.w.WriteByte('('); err != nil {
-				return nil, fmt.Errorf("writing '(': %w", err)
+		if entering {
+			if len(vis.stack) > 1 {
+				if err := vis.w.WriteByte('('); err != nil {
+					return nil, fmt.Errorf("writing '(': %w", err)
+				}
 			}
-		}
-		if _, err := vis.w.WriteString("SELECT "); err != nil {
-			return nil, fmt.Errorf("writing 'SELECT': %w", err)
-		}
-		if !entering && len(vis.stack) > 0 {
+			if _, err := vis.w.WriteString("SELECT "); err != nil {
+				return nil, fmt.Errorf("writing 'SELECT': %w", err)
+			}
+		} else if len(vis.stack) > 0 {
 			if err := vis.w.WriteByte(')'); err != nil {
 				return nil, fmt.Errorf("writing ')': %w", err)
 			}
@@ -517,7 +507,11 @@ func (vis *defaultSQLWriterVisitor) Visit(ctx context.Context, node sqllang.Node
 				}
 			}
 		} else {
-			vis.top(1).wroteColumn = true
+			vis.top(0).wroteColumn = true
+			if err := vis.writeExpr(ctx, "column", node.Expr); err != nil {
+				return nil, fmt.Errorf("writing column: %w", err)
+			}
+			return vis, vis.writeAlias(ctx, node.Alias)
 		}
 	case *sqllang.Source:
 		if entering {
@@ -592,6 +586,17 @@ func (vis *defaultSQLWriterVisitor) Visit(ctx context.Context, node sqllang.Node
 		}
 	}
 	return vis, nil
+}
+
+func (vis *defaultSQLWriterVisitor) writeAlias(ctx context.Context, alias string) (err error) {
+	if alias == "" {
+		return nil
+	}
+	if err = vis.w.WriteByte(' '); err != nil {
+		return err
+	}
+	_, err = vis.w.WriteString(alias)
+	return
 }
 
 func (vis *defaultSQLWriterVisitor) writeExpr(ctx context.Context, what string, e expr.Expr) (err error) {

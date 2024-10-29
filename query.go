@@ -73,8 +73,8 @@ type pqData struct {
 
 func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (stream.Stream, error) {
 	tq, _ := tableQueryOf(q)
-	preparer, ok := ctxutil.Value(ctx, (*sqlPreparer)(nil)).(sqlPreparer)
 	db := tq.table.db
+	preparer, ok := ctxutil.Value(ctx, (*sqlPreparer)(nil)).(sqlPreparer)
 	if !ok {
 		preparer = db.db
 	}
@@ -91,12 +91,9 @@ func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (stream.Stre
 		}
 	}
 	sb := strings.Builder{}
-	sw, err := MakeSQLWriter(
+	sw, err := db.info.MakeSQLWriter(
 		ctx,
 		smallWriterCounterOf(&sb),
-		WithArgWriterTo(db.argWriterTo),
-		WithExprWriterTo(db.exprWriterTo),
-		WithSQLWriterTo(db.sqlWriterTo),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("building SQLWriter: %w", err)
@@ -111,6 +108,12 @@ func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (stream.Stre
 	_, err = sw.WriteSQL(ctx, sn)
 	if err != nil {
 		return nil, fmt.Errorf("writing SQL: %w", err)
+	}
+	if err := sb.WriteByte(';'); err != nil {
+		return nil, fmt.Errorf(
+			"failed to write terminating semicolon to %v: %w",
+			sb, err,
+		)
 	}
 	sqlStmtStr := sb.String()
 	if db.shouldPreparer.shouldPrepare(ctx, q) {
@@ -144,7 +147,7 @@ func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (stream.Stre
 			ptrPqData,
 		)
 	}
-	args, err := getOrAppendSQLArgs(ctx, nil, data.args)
+	args, err := getOrAppendSQLArgs(ctx, nil, sw.Args())
 	if err != nil {
 		return nil, fmt.Errorf(
 			"getting args for %v: %w",
@@ -158,7 +161,7 @@ func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (stream.Stre
 			q, err,
 		)
 	}
-	return createStreamFromRows(ctx, tq.table, rows)
+	return createStreamFromRows(tq.table, rows)
 }
 
 func (data *pqData) executeQueryStatement(ctx context.Context, t table, stmt *sql.Stmt) (stream.Stream, error) {
@@ -170,10 +173,10 @@ func (data *pqData) executeQueryStatement(ctx context.Context, t table, stmt *sq
 	if err != nil {
 		return nil, err
 	}
-	return createStreamFromRows(ctx, t, rows)
+	return createStreamFromRows(t, rows)
 }
 
-func createStreamFromRows(ctx context.Context, t table, rows *sql.Rows) (stream.Stream, error) {
+func createStreamFromRows(t table, rows *sql.Rows) (stream.Stream, error) {
 	return &rowsStream{
 		modelType: t.modelType,
 		rows:      rows,
@@ -188,7 +191,14 @@ func createSQLNodeFromQuery(ctx context.Context, q query) (sn sqllang.Node, err 
 	}
 	t.init(q, 0)
 	src := &sqllang.Source{}
-	return src, initSQLSourceFromQueryTree(ctx, src, nil, t, 0)
+	err = initSQLSourceFromQueryTree(ctx, nil, src, t, 0)
+	if err != nil {
+		return nil, err
+	}
+	if src.Select != nil {
+		return src.Select, nil
+	}
+	return src, nil
 }
 
 func initSQLSourceFromQueryTree(ctx context.Context, parent, src *sqllang.Source, t queryJoinTree, queryJoinTreeIndex int) error {
@@ -269,7 +279,9 @@ func initSQLSourceFromQueryTree(ctx context.Context, parent, src *sqllang.Source
 			}
 		case *joinQuery:
 			joins := joinsOf(src)
-			*joins = append(*joins, sqllang.Join{})
+			*joins = append(*joins, sqllang.Join{
+				On: q.on,
+			})
 			joinSrc := &(*joins)[len(*joins)-1].Source
 			if err := initSQLSourceFromQueryTree(
 				ctx,
@@ -283,16 +295,22 @@ func initSQLSourceFromQueryTree(ctx context.Context, parent, src *sqllang.Source
 			demoteToSource(src.Select, joinSrc)
 		case *mapQuery:
 			panic("// TODO: implement *mapQuery")
+		case *sortQuery:
+			sel := promoteToSelect(src)
+			sel.OrderBy = append(sel.OrderBy, sqllang.Sort{
+				By:   q.sort,
+				Desc: q.descending,
+			})
 		case *tableQuery:
 			if queryJoinTreeIndex == 0 || src.Select != nil {
 				if err := initSQLSelectFromTableQuery(
-					ctx, promoteToSelect(src), q,
+					promoteToSelect(src), q,
 				); err != nil {
 					return err
 				}
 			} else {
 				if err := initSQLSourceTableAndAliasFromTableQuery(
-					ctx, src, q,
+					src, q,
 				); err != nil {
 					return err
 				}
@@ -302,7 +320,7 @@ func initSQLSourceFromQueryTree(ctx context.Context, parent, src *sqllang.Source
 	return nil
 }
 
-func initSQLSelectFromTableQuery(ctx context.Context, sel *sqllang.Select, q *tableQuery) error {
+func initSQLSelectFromTableQuery(sel *sqllang.Select, q *tableQuery) error {
 	ddlCols := q.table.sqlTable.Columns
 	sel.Columns = make([]sqllang.Column, len(ddlCols))
 	t := reflect.New(q.table.modelType.unsafereflectType.ReflectType()).Interface()
@@ -312,10 +330,10 @@ func initSQLSelectFromTableQuery(ctx context.Context, sel *sqllang.Select, q *ta
 			Expr: expr.MemOf(q, t, f),
 		}
 	}
-	return initSQLSourceTableAndAliasFromTableQuery(ctx, &sel.From, q)
+	return initSQLSourceTableAndAliasFromTableQuery(&sel.From, q)
 }
 
-func initSQLSourceTableAndAliasFromTableQuery(ctx context.Context, src *sqllang.Source, q *tableQuery) error {
+func initSQLSourceTableAndAliasFromTableQuery(src *sqllang.Source, q *tableQuery) error {
 	sb := strings.Builder{}
 	sb.WriteByte('"')
 	st := q.table.sqlTable
@@ -349,6 +367,16 @@ func (t *queryJoinTree) init(q query, queryIndex int) {
 	})
 	for i, q := range t.queries[start:end] {
 		if jq, ok := q.(*joinQuery); ok {
+			if Debug {
+				for _, q2 := range t.queries {
+					if q == q2 {
+						panic(fmt.Errorf(
+							"recursive query detected: %v has already been added to the query tree: %#v",
+							q, t.queries,
+						))
+					}
+				}
+			}
 			t.init(jq.to, start+i)
 		}
 	}
@@ -380,7 +408,15 @@ func (q *tableQuery) preparedQuery() *preparedQuery { return &q.prepared }
 
 var _ interface {
 	query
+	stream.Filterer
 } = (*tableQuery)(nil)
+
+func (q *tableQuery) Filter(ctx context.Context, e expr.Expr) stream.Streamer {
+	return &filterQuery{
+		from:   q,
+		filter: e,
+	}
+}
 
 func (q *tableQuery) Name() string {
 	writeFirstRuneOfEachNamePart := func(sb *strings.Builder, name string) {
@@ -393,7 +429,6 @@ func (q *tableQuery) Name() string {
 			}
 			name = suffix
 		}
-		return
 	}
 	return q.name.LoadOrCreate(q, func(arg interface{}) string {
 		q := arg.(*tableQuery)
@@ -406,6 +441,7 @@ func (q *tableQuery) Name() string {
 		return sb.String()
 	})
 }
+
 func (q *tableQuery) Stream(ctx context.Context) (stream.Stream, error) {
 	return q.prepared.executeQuery(ctx, q)
 }
@@ -461,7 +497,7 @@ func (q *joinQuery) Name() string {
 func (q *joinQuery) Stream(ctx context.Context) (stream.Stream, error) {
 	return q.prepared.executeQuery(ctx, q)
 }
-func (q *joinQuery) Var() expr.Var { return q.Var() }
+func (q *joinQuery) Var() expr.Var { return q }
 
 type mapQuery struct {
 	from     query

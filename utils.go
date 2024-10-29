@@ -94,7 +94,12 @@ func (p *atomicString) LoadOrCreate(arg interface{}, create func(interface{}) st
 		}
 		valueSH.Data = atomic.LoadUintptr(&sh.Data)
 	}
-	for atomicLoadInt(&sh.Len) == 0 {
+	i := 0
+	const maxIterations = 1000
+	for ; atomicLoadInt(&sh.Len) == 0 && i < maxIterations; i++ {
+	}
+	if i == maxIterations {
+		panic("length was not written")
 	}
 	return p.unsafeValue
 }

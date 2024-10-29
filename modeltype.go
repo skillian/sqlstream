@@ -13,8 +13,6 @@ import (
 	"github.com/skillian/sqlstream/sqllang"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 	"github.com/skillian/unsafereflect"
-
-	"github.com/davecgh/go-spew/spew"
 )
 
 // modelType holds sqlstream-specific data associated with models
@@ -48,7 +46,7 @@ type modelType struct {
 	//
 	flatFieldIndexes []int
 
-	structFields []reflect.StructField
+	structFields []modelStructField
 
 	rawName sqlddl.TableName
 	sqlName sqlddl.TableName
@@ -57,6 +55,20 @@ type modelType struct {
 	// columnNames[len(columnNames):cap(columnNames)] are the sqlNames
 	columnNames []string
 	columnTypes []sqllang.Type
+}
+
+type modelStructField struct {
+	reflect.StructField
+
+	// urFieldPath is the path of unsafereflect.Types and their
+	// fields from the model to the inner value
+	urFieldPath    []modelStructFieldHop
+	urtStructField *reflect.StructField
+}
+
+type modelStructFieldHop struct {
+	urType     *unsafereflect.Type
+	fieldIndex int
 }
 
 func modelTypeOf(v interface{}) *modelType {
@@ -83,6 +95,22 @@ var (
 	modelTypes sync.Map
 )
 
+// makeRawNameFromGoName converts a Go name like "HTTPRequestHandler"
+// into "HTTP Request Handler".
+func makeRawNameFromGoName(goName string) string {
+	sb := strings.Builder{}
+	splitGoName(goName, nil, func(arg interface{}, part string) error {
+		if sb.Len() > 0 {
+			if err := sb.WriteByte(' '); err != nil {
+				return err
+			}
+		}
+		_, err := sb.WriteString(part)
+		return err
+	})
+	return sb.String()
+}
+
 // splitGoName splits a Go identifier into separate parts (e.g.
 // "ObjectName" is yielded as "Object" and "Name") and supports
 // acronyms like "ID", "HTTP", etc.
@@ -97,7 +125,7 @@ func splitGoName(name string, arg interface{}, fn func(arg interface{}, part str
 		fn:  fn,
 		buf: make([]byte, 0, arbitraryCapacity),
 	}
-	return splitGoNameNoAcronyms(name, &wrapped, func(arg interface{}, part string) error {
+	if err := splitGoNameNoAcronyms(name, &wrapped, func(arg interface{}, part string) error {
 		wrapped := arg.(*wrappedArg)
 		r, n := utf8.DecodeRuneInString(part)
 		if len(part) == n /* is single "letter" */ && unicode.IsUpper(r) {
@@ -112,7 +140,13 @@ func splitGoName(name string, arg interface{}, fn func(arg interface{}, part str
 			}
 		}
 		return wrapped.fn(wrapped.arg, part)
-	})
+	}); err != nil {
+		return err
+	}
+	if len(wrapped.buf) > 0 {
+		return fn(arg, string(wrapped.buf))
+	}
+	return nil
 }
 
 // splitGoNameNoAcronyms is a simple Go identifier tokenizer.  It takes
@@ -173,7 +207,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 		sfs := urt.ReflectStructFields()
 		fieldIndexes := make([][2]int, 0, 2<<bits.Len(uint(len(sfs))))
 		flatFieldIndexes := make([]int, 0, cap(fieldIndexes)*cap(fieldIndexes)/2)
-		structFields := make([]reflect.StructField, 0, cap(fieldIndexes))
+		structFields := make([]modelStructField, 0, cap(fieldIndexes))
 		columnNames := make([]string, 0, cap(structFields))
 		columnTypes := make([]sqllang.Type, 0, cap(structFields))
 		for i := range sfs {
@@ -186,8 +220,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 				_, _ = after, ok
 				continue
 			}
-			switch sf.Type.Kind() {
-			case reflect.Struct:
+			if sf.Type.Kind() == reflect.Struct && !sf.Type.AssignableTo(sqlScannerType) {
 				// a "substruct:"
 				submodel := modelTypeOfReflectType(sf.Type)
 				_ = submodel.iterFields(nil, func(
@@ -211,18 +244,51 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 							ffStartIndex + len(flatFieldIndexes),
 						},
 					)
-					structFields = append(structFields, *f.reflectStructField)
-					structFields[len(structFields)-1].Offset += sf.Offset
-					columnNames = append(columnNames, f.rawName, f.sqlName)
+					structFields = append(structFields, modelStructField{
+						StructField: *f.reflectStructField,
+						urFieldPath: make([]modelStructFieldHop, len(f.unsafereflectTypePath)+1),
+						urtStructField: &f.unsafereflectTypePath[len(f.unsafereflectTypePath)-1].
+							ReflectStructFields()[f.fieldIndex[len(f.fieldIndex)-1]],
+					})
+					subSf := &structFields[len(structFields)-1]
+					subSf.Offset += sf.Offset
+					subSf.urFieldPath[0] = modelStructFieldHop{
+						urType:     urt,
+						fieldIndex: i,
+					}
+					for i, urt := range f.unsafereflectTypePath {
+						subSf.urFieldPath[i+1] = modelStructFieldHop{
+							urType:     urt,
+							fieldIndex: f.fieldIndex[i],
+						}
+					}
+					if len(submodel.structFields) == 1 {
+						// Assume this is a wrapper struct just
+						// for typesafety; the field name
+						// is the most important
+						f.rawName = ""
+						f.sqlName = ""
+						subSf.Name = ""
+					}
+					subSf.Name = sf.Name + subSf.Name
+					columnNames = append(columnNames, submodel.rawName.Name+f.rawName, submodel.sqlName.Name+f.sqlName)
 					columnTypes = append(columnTypes, f.sqlType)
 					return nil
 				})
-			default:
+			} else {
 				j := len(flatFieldIndexes)
 				flatFieldIndexes = append(flatFieldIndexes, i)
 				fieldIndexes = append(fieldIndexes, [2]int{j, j + 1})
-				structFields = append(structFields, *sf)
+				structFields = append(structFields, modelStructField{
+					StructField: *sf,
+					urFieldPath: []modelStructFieldHop{
+						{urType: urt, fieldIndex: i},
+					},
+				})
 				rawName, sqlName, after, ok := parseNameFromTag(sf.Tag)
+				if strings.TrimSpace(rawName) == "" {
+					rawName = makeRawNameFromGoName(sf.Name)
+				}
 				columnNames = append(columnNames, rawName, sqlName)
 				var columnType sqllang.Type
 				if ok {
@@ -235,6 +301,13 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 							panic(err)
 						}
 					}
+				}
+				if ok || len(after) > 0 {
+					logger.Warn4(
+						"extra data in %s.%s %s tag: %s",
+						rt.Name(), sf.Name,
+						tagName, after,
+					)
 				}
 				if columnType == nil {
 					columnType = sqllang.TypeFromReflectType(sf.Type)
@@ -257,15 +330,9 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 		// "encode" the length into the len part of the slice:
 		mt.flatFieldIndexes = mt.flatFieldIndexes[:len(fieldIndexes)]
 		if mt.rawName == (sqlddl.TableName{}) {
-			parts := make([]string, 0, arbitraryCapacity)
-			splitGoName(rt.Name(), &parts, func(arg interface{}, part string) error {
-				parts := arg.(*[]string)
-				*parts = append(*parts, part)
-				return nil
-			})
-			mt.rawName.Parse(strings.Join(parts, " "))
+			mt.rawName.Parse(makeRawNameFromGoName(rt.Name()))
 		}
-		mt.structFields = make([]reflect.StructField, len(structFields))
+		mt.structFields = make([]modelStructField, len(structFields))
 		copy(mt.structFields, structFields)
 		// columnNames =    [col 0 rawName, col 0 sqlName, col 1 rawName, col 1 sqlName]
 		// mt.columnNames = [col 0 rawName, col 1 rawName, col 0 sqlName, col 1 sqlName]
@@ -281,7 +348,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 		}
 		mt.columnTypes = make([]sqllang.Type, len(columnTypes))
 		copy(mt.columnTypes, columnTypes)
-		logger.Verbose1("%v", spew.Sdump(mt))
+		//logger.Verbose1("%v", spew.Sdump(mt))
 		return
 	}
 	key := interface{}(rt)
@@ -302,9 +369,6 @@ func (mt *modelType) AppendFieldPointers(args []interface{}, v interface{}) []in
 func (mt *modelType) AppendUnsafeFieldValues(args []interface{}, v interface{}) []interface{} {
 	return mt.appendFields(args, v, (*unsafereflect.Type).UnsafeFieldValue)
 }
-
-// ReflectStructFields gets the struct fields that will be scanned into
-func (mt *modelType) ReflectStructFields() []reflect.StructField { return mt.structFields }
 
 func (mt *modelType) appendFields(args []interface{}, v interface{}, f func(*unsafereflect.Type, interface{}, int) interface{}) []interface{} {
 	_ = mt.iterFields(v, func(mtif *modelTypeIterField) error {
@@ -368,8 +432,8 @@ func (mt *modelType) iterFields(arg interface{}, eachField func(f *modelTypeIter
 			}
 		}
 		mtif.reflectStructField = &mt.unsafereflectType.ReflectStructFields()[mtif.fieldIndex[len(mtif.fieldIndex)-1]]
-		mtif.rawName = mt.columnNames[mtif.index]
-		mtif.sqlName = mt.columnNames[:cap(mt.columnNames)][len(mt.columnNames)+mtif.index]
+		mtif.rawName = mt.columnRawNames()[mtif.index]
+		mtif.sqlName = mt.columnSQLNames()[mtif.index]
 		mtif.sqlType = mt.columnTypes[mtif.index]
 		if err := eachField(mtif); err != nil {
 			return err

@@ -71,6 +71,18 @@ type NameWritersTo struct {
 	Schema NameWriterTo
 }
 
+func (nwt *NameWritersTo) init() {
+	if nwt.Column == nil {
+		nwt.Column = SnakeCaseLower
+	}
+	if nwt.Table == nil {
+		nwt.Table = SnakeCaseLower
+	}
+	if nwt.Schema == nil {
+		nwt.Schema = SnakeCaseLower
+	}
+}
+
 type snakeCase struct {
 	lowerCase bool
 	upperCase bool

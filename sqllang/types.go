@@ -277,6 +277,7 @@ var (
 			{int8Type, Int8Type},
 			{int16Type, Int16Type},
 			{int32Type, Int32Type},
+			{int64Type, Int64Type},
 			//{uintType, UintType},
 			{uint8Type, Uint8Type},
 			{uint16Type, Uint16Type},
