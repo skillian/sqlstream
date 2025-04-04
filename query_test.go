@@ -2,7 +2,6 @@ package sqlstream
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"io"
 	"strings"
@@ -48,7 +47,7 @@ func TestStringsCutTrimSpaceTests(t *testing.T) {
 // database.  If key is empty, a unique in-memory database is returned.
 // Otherwise, any calls to this function that request the same key
 // will get the same database
-func getOrCreateTestDB(t *testing.T, key string) *DB {
+func getOrCreateTestDB(t *testing.T, key string, options ...DBOption) *DB {
 	t.Helper()
 	connectionString := ":memory:"
 	if len(key) > 0 {
@@ -58,10 +57,14 @@ func getOrCreateTestDB(t *testing.T, key string) *DB {
 			"?mode=memory&cache=shared",
 		}, "")
 	}
-	db, err := NewDB(
-		WithSQLOpen("sqlite3", connectionString),
-		WithQueryPrepareAfterCount(1),
-	)
+	{
+		options2 := make([]DBOption, len(options)+2)
+		options2[0] = WithSQLOpen("sqlite3", connectionString)
+		options2[1] = WithQueryPrepareAfterCount(1)
+		copy(options2[2:], options)
+		options = options2
+	}
+	db, err := NewDB(options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,26 +81,35 @@ func TestQuery(t *testing.T) {
 		logging.HandlerLevel(logging.EverythingLevel),
 	)
 	defer cleanupTestingHandler()
-	db := getOrCreateTestDB(t, testDBKey)
+	dbi := DBInfo{}
 	ctx, vs := expr.GetOrAddValuesToContext(context.Background())
+	ctx = dbi.AddToContext(ctx)
 	ctx = ctxutil.WithValue(
 		ctx,
-		(*sqlPreparer)(nil),
-		&loggerPreparer{
-			db:     db,
+		(*sqlQuerier)(nil),
+		&loggerQuerier{
+			dbi:    &dbi,
 			logger: logger,
 			level:  logging.EverythingLevel,
 		},
 	)
-	m := &testThing{
-		ThingID:   testThingID{123},
-		ThingName: "foo",
+	h := &testHand{
+		HandID: testHandID{456},
 	}
-	// db.Save(ctx, []interface{}{m})
-	q := db.Query(ctx, m)
-	q = stream.Filter(ctx, q, expr.Eq{expr.MemOf(q.Var(), m, &m.ThingID), 123})
-	vs.Set(ctx, q.Var(), m)
-	st, err := q.Stream(ctx)
+	f := &testFinger{
+		FingerID:   testFingerID{123},
+		FingerName: "foo",
+		HandID:     h.HandID,
+	}
+	db := getOrCreateTestDB(t, testDBKey, WithDBInfo(&dbi))
+	db.Save(ctx, []interface{}{h, f})
+	fq := Query(ctx, f)
+	fq = stream.Filter(ctx, fq, expr.Eq{expr.MemOf(fq.Var(), f, &f.FingerID), 123})
+	hq := Query(ctx, h)
+	fq = stream.Join(ctx, fq, hq, expr.Eq{expr.MemOf(fq.Var(), f, &f.HandID), expr.MemOf(hq.Var(), h, &h.HandID)}, expr.Tuple{fq.Var(), hq.Var()})
+	vs.Set(ctx, fq.Var(), f)
+	vs.Set(ctx, hq.Var(), h)
+	st, err := fq.Stream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,15 +123,18 @@ func TestQuery(t *testing.T) {
 	}
 }
 
-type loggerPreparer struct {
-	db     *DB
+type loggerQuerier struct {
+	dbi    *DBInfo
 	logger *logging.Logger
 	level  logging.Level
 }
 
-var _ sqlPreparer = (*loggerPreparer)(nil)
+var _ sqlQuerier = (*loggerQuerier)(nil)
 
-func (lp *loggerPreparer) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
-	lp.logger.Log2(lp.level, "db: %v, query:\n%v", lp.db, query)
-	return lp.db.db.PrepareContext(ctx, query)
+func (lq *loggerQuerier) QueryContext(ctx context.Context, s string, args ...interface{}) (sqlRows, error) {
+	logger.Log2(
+		lq.level, "SQL string:\n\t%s\nargs:\n\t%#v",
+		s, args,
+	)
+	return emptyRows{}, nil
 }

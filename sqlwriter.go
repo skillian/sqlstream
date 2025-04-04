@@ -55,6 +55,7 @@ type ExprWriterTo interface {
 		swt SQLWriterTo,
 		awt ArgWriterTo,
 		currentArgs []interface{},
+		columnNameOf func(expr.Mem) (string, error),
 		e expr.Expr,
 	) (
 		newArgs []interface{},
@@ -73,6 +74,7 @@ type SQLWriterTo interface {
 		ewt ExprWriterTo,
 		awt ArgWriterTo,
 		currentArgs []interface{},
+		columnNameOf func(expr.Mem) (string, error),
 		sql sqllang.Node,
 	) (
 		newArgs []interface{},
@@ -93,9 +95,10 @@ type SQLWriter interface {
 // sqlWriter is the default SQLWriter implementation that uses
 // an ArgWriterTo, ExprWriterTo, and SQLWriterTo to generate SQL.
 type sqlWriter struct {
-	w      smallWriterCounter
-	dbInfo *DBInfo
-	args   []interface{}
+	w            smallWriterCounter
+	dbInfo       *DBInfo
+	args         []interface{}
+	columnNameOf func(m expr.Mem) (string, error)
 }
 
 var _ interface {
@@ -105,6 +108,43 @@ var _ interface {
 func (sw *sqlWriter) init(dbi *DBInfo, w io.Writer) {
 	sw.dbInfo = dbi
 	sw.w.smallWriter = SmallWriterOf(w)
+	sw.columnNameOf = func(m expr.Mem) (string, error) {
+		q, ok := m[0].(query)
+		if !ok {
+			return "", fmt.Errorf(
+				"cannot get member of non-query: %v (type: %[1]T)",
+				m[0],
+			)
+		}
+		e, ok := m[1].(*reflect.StructField)
+		if !ok {
+			return "", fmt.Errorf(
+				"cannot get non-struct field (%[1]v (type: %[1]T) of query %v",
+				e, q,
+			)
+		}
+		tq, _ := tableQueryOf(q)
+		mt := tq.modelType
+		fieldIndex := func() int {
+			for i := range mt.structFields {
+				for _, fp := range mt.structFields[i].urFieldPath {
+					if &fp.urType.ReflectStructFields()[fp.fieldIndex] == e {
+						return i
+					}
+				}
+			}
+			return -1
+		}()
+		if fieldIndex == -1 {
+			return "", fmt.Errorf(
+				"failed to find member %v of %v",
+				e.Name,
+				tq.modelType.unsafereflectType.ReflectType().Name(),
+			)
+		}
+		sqlTable := sw.dbInfo.sqlTableOf(mt)
+		return sqlTable.Columns[fieldIndex].ColumnName.Name, nil
+	}
 }
 
 //type sqlWriterOptionFunc func(*sqlWriter) error
@@ -149,29 +189,31 @@ func WithSQLWriterTo(swt SQLWriterTo) interface {
 func (sw *sqlWriter) Args() []interface{} { return sw.args }
 
 func (sw *sqlWriter) WriteArg(ctx context.Context, arg interface{}) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.ArgWriterTo.WriteArgTo(ctx, &sw.w, sw.args, arg)
+	sw.args, n, err = sw.dbInfo.getArgWriterTo().WriteArgTo(ctx, &sw.w, sw.args, arg)
 	return
 }
 
 func (sw *sqlWriter) WriteExpr(ctx context.Context, e expr.Expr) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.ExprWriterTo.WriteExprTo(
+	sw.args, n, err = sw.dbInfo.getExprWriterTo().WriteExprTo(
 		ctx,
 		&sw.w,
-		sw.dbInfo.SQLWriterTo,
-		sw.dbInfo.ArgWriterTo,
+		sw.dbInfo.getSQLWriterTo(),
+		sw.dbInfo.getArgWriterTo(),
 		sw.args,
+		sw.columnNameOf,
 		e,
 	)
 	return
 }
 
 func (sw *sqlWriter) WriteSQL(ctx context.Context, s sqllang.Node) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.SQLWriterTo.WriteSQLTo(
+	sw.args, n, err = sw.dbInfo.getSQLWriterTo().WriteSQLTo(
 		ctx,
 		&sw.w,
-		sw.dbInfo.ExprWriterTo,
-		sw.dbInfo.ArgWriterTo,
+		sw.dbInfo.getExprWriterTo(),
+		sw.dbInfo.getArgWriterTo(),
 		sw.args,
+		sw.columnNameOf,
 		s,
 	)
 	return
@@ -198,6 +240,7 @@ func (defaultExprWriterTo) WriteExprTo(
 	swt SQLWriterTo,
 	awt ArgWriterTo,
 	currentArgs []interface{},
+	columnNameOf func(m expr.Mem) (string, error),
 	e expr.Expr,
 ) (
 	newArgs []interface{},
@@ -207,11 +250,12 @@ func (defaultExprWriterTo) WriteExprTo(
 	swc := smallWriterCounterOf(w)
 	start := swc.written
 	v := &defaultExprWriterVisitor{
-		w:           swc,
-		argWriterTo: awt,
-		sqlWriterTo: swt,
-		args:        currentArgs,
-		stack:       make([]defaultExprWriterVisitorFrame, 1, arbitraryCapacity),
+		w:            swc,
+		argWriterTo:  awt,
+		sqlWriterTo:  swt,
+		args:         currentArgs,
+		columnNameOf: columnNameOf,
+		stack:        make([]defaultExprWriterVisitorFrame, 1, arbitraryCapacity),
 	}
 	err = expr.Walk(ctx, e, v)
 	n = swc.written - start
@@ -220,11 +264,12 @@ func (defaultExprWriterTo) WriteExprTo(
 }
 
 type defaultExprWriterVisitor struct {
-	w           *smallWriterCounter
-	argWriterTo ArgWriterTo
-	sqlWriterTo SQLWriterTo
-	args        []interface{}
-	stack       []defaultExprWriterVisitorFrame
+	w            *smallWriterCounter
+	argWriterTo  ArgWriterTo
+	sqlWriterTo  SQLWriterTo
+	args         []interface{}
+	columnNameOf func(m expr.Mem) (string, error)
+	stack        []defaultExprWriterVisitorFrame
 }
 
 var _ expr.Visitor = (*defaultExprWriterVisitor)(nil)
@@ -306,33 +351,10 @@ func (vis *defaultExprWriterVisitor) Visit(ctx context.Context, e expr.Expr) (v2
 		}
 	case *reflect.StructField:
 		if mem, ok := sec.e.(expr.Mem); ok {
-			q, ok := mem[0].(query)
-			if !ok {
-				return nil, fmt.Errorf(
-					"cannot get member of non-query: %v (type: %[1]T)",
-					mem[0],
-				)
+			colName, err := vis.columnNameOf(mem)
+			if err != nil {
+				return nil, err
 			}
-			tq, _ := tableQueryOf(q)
-			mt := tq.table.modelType
-			fieldIndex := func() int {
-				for i := range mt.structFields {
-					for _, fp := range mt.structFields[i].urFieldPath {
-						if &fp.urType.ReflectStructFields()[fp.fieldIndex] == e {
-							return i
-						}
-					}
-				}
-				return -1
-			}()
-			if fieldIndex == -1 {
-				return nil, fmt.Errorf(
-					"failed to find member %v of %v",
-					e.Name,
-					tq.table.modelType.unsafereflectType.ReflectType().Name(),
-				)
-			}
-			colName := tq.table.sqlTable.Columns[fieldIndex].ColumnName.Name
 			if err := vis.w.WriteByte('"'); err != nil {
 				return nil, fmt.Errorf(
 					"writing quote before column %v: %w",
@@ -443,6 +465,7 @@ func (swt defaultSQLWriterTo) WriteSQLTo(
 	ewt ExprWriterTo,
 	awt ArgWriterTo,
 	currentArgs []interface{},
+	columnNameOf func(m expr.Mem) (string, error),
 	node sqllang.Node,
 ) (
 	newArgs []interface{},
@@ -456,6 +479,7 @@ func (swt defaultSQLWriterTo) WriteSQLTo(
 		argWriterTo:  awt,
 		exprWriterTo: ewt,
 		sqlWriterTo:  swt,
+		columnNameOf: columnNameOf,
 		args:         currentArgs,
 	}
 	err = sqllang.Walk(ctx, node, v)
@@ -470,6 +494,7 @@ type defaultSQLWriterVisitor struct {
 	exprWriterTo ExprWriterTo
 	sqlWriterTo  SQLWriterTo
 	args         []interface{}
+	columnNameOf func(m expr.Mem) (string, error)
 	stack        []defaultSQLWriterVisitorFrame
 }
 
@@ -515,8 +540,10 @@ func (vis *defaultSQLWriterVisitor) Visit(ctx context.Context, node sqllang.Node
 		}
 	case *sqllang.Source:
 		if entering {
-			if _, err := vis.w.WriteString(" FROM "); err != nil {
-				return nil, err
+			if _, ok := vis.top(1).node.(*sqllang.Select); ok {
+				if _, err := vis.w.WriteString(" FROM "); err != nil {
+					return nil, err
+				}
 			}
 			if node.Table != "" {
 				if _, err := vis.w.WriteString(node.Table); err != nil {
@@ -606,6 +633,7 @@ func (vis *defaultSQLWriterVisitor) writeExpr(ctx context.Context, what string, 
 		vis.sqlWriterTo,
 		vis.argWriterTo,
 		vis.args,
+		vis.columnNameOf,
 		e,
 	); err != nil {
 		err = fmt.Errorf(

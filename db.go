@@ -3,12 +3,15 @@ package sqlstream
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"sync"
 	"sync/atomic"
 
-	"github.com/skillian/expr/stream"
+	"github.com/skillian/ctxutil"
+	"github.com/skillian/expr"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
 )
 
@@ -24,9 +27,50 @@ type sqlPreparer interface {
 	PrepareContext(context.Context, string) (*sql.Stmt, error)
 }
 
-type sqlQuerier interface {
+type sqlSQLQuerier interface {
 	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
 }
+
+type sqlQuerier interface {
+	QueryContext(context.Context, string, ...interface{}) (sqlRows, error)
+}
+
+type sqlQuerierFunc func(context.Context, string, ...interface{}) (sqlRows, error)
+
+func (f sqlQuerierFunc) QueryContext(ctx context.Context, s string, args ...interface{}) (sqlRows, error) {
+	return f(ctx, s, args)
+}
+
+func sqlQuerierWrapRows(q sqlSQLQuerier) sqlQuerier {
+	return sqlQuerierFunc(func(ctx context.Context, s string, args ...interface{}) (sqlRows, error) {
+		rows, err := q.QueryContext(ctx, s, args)
+		return rows, err
+	})
+}
+
+type sqlRows interface {
+	Close() error
+	ColumnTypes() ([]*sql.ColumnType, error)
+	Columns() ([]string, error)
+	Err() error
+	Next() bool
+	NextResultSet() bool
+	Scan(...interface{}) error
+}
+
+var _ sqlRows = (*sql.Rows)(nil)
+
+type emptyRows struct{}
+
+var _ sqlRows = emptyRows{}
+
+func (emptyRows) Close() error                            { return nil }
+func (emptyRows) ColumnTypes() ([]*sql.ColumnType, error) { return nil, nil }
+func (emptyRows) Columns() ([]string, error)              { return nil, nil }
+func (emptyRows) Err() error                              { return nil }
+func (emptyRows) Next() bool                              { return false }
+func (emptyRows) NextResultSet() bool                     { return false }
+func (emptyRows) Scan(args ...interface{}) error          { return nil }
 
 type sqlStmter interface {
 	StmtContext(ctx context.Context, stmt *sql.Stmt) *sql.Stmt
@@ -36,23 +80,76 @@ type sqlTxer interface {
 	BeginTx(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error)
 }
 
+var ignoreErrorFunc = func(error) error { return nil }
+
+func WithTransaction(ctx context.Context) (txCtx context.Context, endTx func(err error) error, err error) {
+	txer, ok := ctxutil.Value(ctx, (*sqlTxer)(nil)).(sqlTxer)
+	if !ok {
+		return ctx, ignoreErrorFunc, fmt.Errorf("no %T in context", txer)
+	}
+	tx, err := txer.BeginTx(ctx, nil)
+	if err != nil {
+		return ctx, ignoreErrorFunc, fmt.Errorf("beginning transaction: %w", err)
+	}
+	return ctxutil.WithValue(ctx, (*sql.Tx)(nil), tx), func(err error) error {
+		if err == nil {
+			if err = tx.Commit(); err != nil {
+				return fmt.Errorf(
+					"committing transaction %v: %w",
+					tx, err,
+				)
+			}
+			return nil
+		}
+		if err2 := tx.Rollback(); err2 != nil {
+			return errors.Join(
+				err,
+				fmt.Errorf(
+					"rolling back transaction %v: %w",
+					tx, err2,
+				),
+			)
+		}
+		logger.Info2(
+			"rolled back transaction %v due to error: %v",
+			tx, err,
+		)
+		return err
+	}, nil
+}
+
 var _ = []interface {
 	sqlExecer
 	sqlPreparer
-	sqlQuerier
+	sqlSQLQuerier
 }{
 	(*sql.DB)(nil),
 	(*sql.Conn)(nil),
 	(*sql.Tx)(nil),
 }
 
+// shouldPreparer checks if a query should be prepared
 type shouldPreparer interface {
+	// shouldPrepare should be called once when checking if a query
+	// should be prepared.  It might mutate the query during this
+	// evaluation (e.g. to increment a counter to indicate that
+	// this is the 2nd, etc. time it's being run).
 	shouldPrepare(context.Context, query) bool
 }
 
-//type shouldPreparerFunc func(ctx context.Context, q query) bool
+type shouldPreparerFunc func(ctx context.Context, q query) bool
 
-//func (f shouldPreparerFunc) shouldPrepare(ctx context.Context, q query) bool { return f(ctx, q) }
+func (f shouldPreparerFunc) shouldPrepare(ctx context.Context, q query) bool { return f(ctx, q) }
+
+// WithNeverPrepare configures a DB to never prepare its queries
+func WithNeverPrepare() DBOption {
+	return dbOptionFunc(func(db *DB) error {
+		db.shouldPreparer = shouldPreparerFunc(func(ctx context.Context, q query) bool {
+			return false
+		})
+		return nil
+	})
+}
 
 type shouldPrepareAfterCount struct{ count int32 }
 
@@ -80,7 +177,7 @@ func WithQueryPrepareAfterCount(count int32) DBOption {
 
 type DB struct {
 	db             *sql.DB
-	info           DBInfo
+	info           *DBInfo
 	shouldPreparer shouldPreparer
 }
 
@@ -102,7 +199,7 @@ func (f dbInfoOptionFunc) applyOptionToDBInfo(dbi *DBInfo) error { return f(dbi)
 
 type dbDBInfoOptionFunc dbInfoOptionFunc
 
-func (f dbDBInfoOptionFunc) applyOptionToDB(db *DB) error          { return f(&db.info) }
+func (f dbDBInfoOptionFunc) applyOptionToDB(db *DB) error          { return f(db.info) }
 func (f dbDBInfoOptionFunc) applyOptionToDBInfo(dbi *DBInfo) error { return f(dbi) }
 
 // WithSQLDB sets the DB's wrapped *sql.DB
@@ -134,25 +231,10 @@ func NewDB(options ...DBOption) (*DB, error) {
 }
 
 func (db *DB) init() {
-	db.info.Init()
 	// defaults:
 	if db.shouldPreparer == nil {
 		db.shouldPreparer = shouldPrepareAfterCount{count: 2}
 	}
-}
-
-// Query creates a query starting from the table associated with the
-// given model
-func (db *DB) Query(ctx context.Context, modelType interface{}) stream.Streamer {
-	mt := modelTypeOf(modelType)
-	tq := &tableQuery{
-		table: table{
-			db:        db,
-			modelType: mt,
-			sqlTable:  db.info.sqlTableOf(mt),
-		},
-	}
-	return tq
 }
 
 // SQLDB gets the *sql.DB that this DB wraps,
@@ -166,17 +248,46 @@ type DBInfo struct {
 	sqlTables     sync.Map // map[*modelType]*sqlddl.Table
 }
 
-func (dbi *DBInfo) Init() {
+var (
+	errDBInfoNotFound      = fmt.Errorf("*DBInfo %w", expr.ErrNotFound)
+	errDBInfoNotFoundInCtx = fmt.Errorf("%w in context", errDBInfoNotFound)
+)
+
+func DBInfoFromContext(ctx context.Context) (dbi *DBInfo, ok bool) {
+	dbi, ok = ctxutil.Value(ctx, (*DBInfo)(nil)).(*DBInfo)
+	return
+}
+
+func WithDBInfo(dbi *DBInfo) DBOption {
+	return dbOptionFunc(func(db *DB) error {
+		db.info = dbi
+		return nil
+	})
+}
+
+func (dbi *DBInfo) AddToContext(ctx context.Context) context.Context {
+	return ctxutil.WithValue(ctx, (*DBInfo)(nil), dbi)
+}
+
+func (dbi *DBInfo) getArgWriterTo() ArgWriterTo {
 	if dbi.ArgWriterTo == nil {
 		dbi.ArgWriterTo = odbcArgWriterTo{}
 	}
+	return dbi.ArgWriterTo
+}
+
+func (dbi *DBInfo) getExprWriterTo() ExprWriterTo {
 	if dbi.ExprWriterTo == nil {
 		dbi.ExprWriterTo = defaultExprWriterTo{}
 	}
+	return dbi.ExprWriterTo
+}
+
+func (dbi *DBInfo) getSQLWriterTo() SQLWriterTo {
 	if dbi.SQLWriterTo == nil {
 		dbi.SQLWriterTo = defaultSQLWriterTo{}
 	}
-	dbi.NameWritersTo.init()
+	return dbi.SQLWriterTo
 }
 
 func (dbi *DBInfo) MakeSQLWriter(ctx context.Context, w io.Writer) (SQLWriter, error) {
@@ -189,11 +300,11 @@ func (dbi *DBInfo) MakeSQLWriter(ctx context.Context, w io.Writer) (SQLWriter, e
 }
 
 func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
-	createName := func(rawName string, nwt NameWriterTo, sqlName *string) {
+	createName := func(rawName string, nwt *NameWriterTo, sqlName *string) {
 		if *sqlName != "" {
 			return
 		}
-		*sqlName = nameString(rawName, nwt)
+		*sqlName = nameString(rawName, getNameWriterTo(nwt, SnakeCaseLower))
 	}
 	createTable := func(mt *modelType) *sqlddl.Table {
 		t := &sqlddl.Table{
@@ -203,12 +314,12 @@ func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
 		if t.TableName == (sqlddl.TableName{}) {
 			createName(
 				mt.rawName.SchemaName.Name,
-				dbi.NameWritersTo.Schema,
+				&dbi.NameWritersTo.Schema,
 				&t.TableName.SchemaName.Name,
 			)
 			createName(
 				mt.rawName.Name,
-				dbi.NameWritersTo.Table,
+				&dbi.NameWritersTo.Table,
 				&t.TableName.Name,
 			)
 		}
@@ -232,7 +343,7 @@ func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
 			if c.ColumnName.Name == "" {
 				createName(
 					f.rawName,
-					dbi.NameWritersTo.Column,
+					&dbi.NameWritersTo.Column,
 					&c.ColumnName.Name,
 				)
 			}

@@ -54,6 +54,16 @@ type NameWriterTo interface {
 	WriteNameTo(w io.Writer, name string) (int, error)
 }
 
+func getNameWriterTo(nwt *NameWriterTo, default_ NameWriterTo) NameWriterTo {
+	if nwt == nil {
+		return default_
+	}
+	if *nwt == nil {
+		*nwt = default_
+	}
+	return *nwt
+}
+
 // nameString uses a name writer to write the given name (with spaces)
 // into an identifier.
 func nameString(name string, nwt NameWriterTo) string {
@@ -69,18 +79,6 @@ type NameWritersTo struct {
 	Column NameWriterTo
 	Table  NameWriterTo
 	Schema NameWriterTo
-}
-
-func (nwt *NameWritersTo) init() {
-	if nwt.Column == nil {
-		nwt.Column = SnakeCaseLower
-	}
-	if nwt.Table == nil {
-		nwt.Table = SnakeCaseLower
-	}
-	if nwt.Schema == nil {
-		nwt.Schema = SnakeCaseLower
-	}
 }
 
 type snakeCase struct {

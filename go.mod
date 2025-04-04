@@ -2,11 +2,6 @@ module github.com/skillian/sqlstream
 
 go 1.17
 
-require (
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/skillian/ctxutil v0.0.0 // indirect
-)
-
 require github.com/skillian/expr v0.0.0
 
 require github.com/skillian/logging v0.0.0
@@ -16,7 +11,11 @@ require (
 	github.com/skillian/errutil v0.0.0
 )
 
-require github.com/skillian/unsafereflect v0.0.0
+require (
+	github.com/mattn/go-sqlite3 v1.14.24
+	github.com/skillian/ctxutil v0.0.0
+	github.com/skillian/unsafereflect v0.0.0
+)
 
 replace github.com/skillian/ctxutil => ../ctxutil
 

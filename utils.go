@@ -3,7 +3,6 @@ package sqlstream
 import (
 	"math/bits"
 	"reflect"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -19,8 +18,6 @@ const (
 )
 
 var (
-	caches = sync.Map{} // map[reflect.Type]sync.Pool[interface{}]
-
 	logger = logging.GetLogger(
 		"sqlstream",
 		logging.LoggerLevel(logging.EverythingLevel),
@@ -96,12 +93,16 @@ func (p *atomicString) LoadOrCreate(arg interface{}, create func(interface{}) st
 	}
 	i := 0
 	const maxIterations = 1000
-	for ; atomicLoadInt(&sh.Len) == 0 && i < maxIterations; i++ {
+	for ; i < maxIterations; i++ {
+		valueSH.Len = atomicLoadInt(&sh.Len)
+		if valueSH.Len > 0 {
+			break
+		}
 	}
 	if i == maxIterations {
 		panic("length was not written")
 	}
-	return p.unsafeValue
+	return value
 }
 
 // func writeByte64(w io.Writer, b byte, currentN int64) (n int64, err error) {

@@ -8,14 +8,6 @@ import (
 	"unsafe"
 )
 
-func tryFlush(v interface{}) (flushed bool, err error) {
-	var flusher interface{ Flush() error }
-	if unwrap(v, &flusher) {
-		return true, flusher.Flush()
-	}
-	return
-}
-
 type RuneWriter interface{ WriteRune(rune) (int, error) }
 
 // SmallWriter extends io.Writer to provide useful methods for writing

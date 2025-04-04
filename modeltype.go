@@ -156,12 +156,14 @@ func splitGoName(name string, arg interface{}, fn func(arg interface{}, part str
 //
 // For acronyms, use splitGoName.
 func splitGoNameNoAcronyms(name string, arg interface{}, fn func(arg interface{}, part string) error) error {
-	const noStart = -1
-	start := noStart
+	// const noStart = -1
+	// start := noStart
+	start := 0
 	for i, r := range []rune(name) {
 		switch {
 		case unicode.IsUpper(r):
-			if start != noStart {
+			// if start != noStart {
+			if start != i {
 				if err := fn(arg, name[start:i]); err != nil {
 					return err
 				}
@@ -169,9 +171,9 @@ func splitGoNameNoAcronyms(name string, arg interface{}, fn func(arg interface{}
 			start = i
 		}
 	}
-	if start != noStart {
-		return fn(arg, name[start:])
-	}
+	// if start != noStart {
+	return fn(arg, name[start:])
+	// }
 	return nil
 }
 
@@ -241,7 +243,7 @@ func modelTypeOfReflectType(rt reflect.Type) *modelType {
 						fieldIndexes,
 						[2]int{
 							ffStartIndex,
-							ffStartIndex + len(flatFieldIndexes),
+							len(flatFieldIndexes),
 						},
 					)
 					structFields = append(structFields, modelStructField{
@@ -431,7 +433,7 @@ func (mt *modelType) iterFields(arg interface{}, eachField func(f *modelTypeIter
 				)
 			}
 		}
-		mtif.reflectStructField = &mt.unsafereflectType.ReflectStructFields()[mtif.fieldIndex[len(mtif.fieldIndex)-1]]
+		mtif.reflectStructField = &mtif.unsafereflectTypePath[len(mtif.unsafereflectTypePath)-1].ReflectStructFields()[mtif.fieldIndex[len(mtif.fieldIndex)-1]]
 		mtif.rawName = mt.columnRawNames()[mtif.index]
 		mtif.sqlName = mt.columnSQLNames()[mtif.index]
 		mtif.sqlType = mt.columnTypes[mtif.index]
