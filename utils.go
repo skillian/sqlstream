@@ -1,6 +1,7 @@
 package sqlstream
 
 import (
+	"fmt"
 	"math/bits"
 	"reflect"
 	"sync/atomic"
@@ -65,18 +66,22 @@ type atomicString struct {
 }
 
 var atomicLoadInt, atomicStoreInt = func() (func(*int) int, func(*int, int)) {
-	if bits.UintSize == 32 {
+	switch bits.UintSize {
+	case 32:
 		return func(p *int) int {
 				return int(atomic.LoadInt32((*int32)(unsafe.Pointer(p))))
 			}, func(p *int, v int) {
 				atomic.StoreInt32((*int32)(unsafe.Pointer(p)), int32(v))
 			}
+	case 64:
+		return func(p *int) int {
+				return int(atomic.LoadInt64((*int64)(unsafe.Pointer(p))))
+			}, func(p *int, v int) {
+				atomic.StoreInt64((*int64)(unsafe.Pointer(p)), int64(v))
+			}
+	default:
+		panic(fmt.Sprintf("unknown UintSize: %d", bits.UintSize))
 	}
-	return func(p *int) int {
-			return int(atomic.LoadInt64((*int64)(unsafe.Pointer(p))))
-		}, func(p *int, v int) {
-			atomic.StoreInt64((*int64)(unsafe.Pointer(p)), int64(v))
-		}
 }()
 
 func (p *atomicString) LoadOrCreate(arg interface{}, create func(interface{}) string) string {

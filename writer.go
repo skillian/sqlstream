@@ -133,6 +133,8 @@ var _ interface {
 	SmallWriter
 } = (*smallWriterCounter)(nil)
 
+func (sw *smallWriterCounter) Size() int64 { return sw.written }
+
 func (sw *smallWriterCounter) Unwrap() interface{} { return sw.smallWriter }
 
 func (sw *smallWriterCounter) Write(b []byte) (n int, err error) {

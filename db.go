@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -13,6 +12,7 @@ import (
 	"github.com/skillian/ctxutil"
 	"github.com/skillian/expr"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
+	"github.com/skillian/unsafereflect"
 )
 
 var (
@@ -80,18 +80,62 @@ type sqlTxer interface {
 	BeginTx(ctx context.Context, options *sql.TxOptions) (*sql.Tx, error)
 }
 
+type typeAny struct {
+	Type reflect.Type
+	Any  any
+}
+
+var sqlIfaceTypes = func() (ts []typeAny) {
+	vs := []any{
+		(*sqlExecer)(nil),
+		(*sqlPreparer)(nil),
+		(*sqlQuerier)(nil),
+		(*sqlSQLQuerier)(nil),
+		(*sqlStmter)(nil),
+		(*sqlTxer)(nil),
+	}
+	ts = make([]typeAny, len(vs))
+	for i, v := range vs {
+		ts[i] = typeAny{reflect.TypeOf(v).Elem(), v}
+	}
+	return
+}()
+
+func addToContextWithSQLInterfaces(ctx context.Context, v any) context.Context {
+	vt := reflect.TypeOf(v)
+	for _, sit := range sqlIfaceTypes {
+		if vt.AssignableTo(sit.Type) {
+			ctx = ctxutil.WithValue(ctx, sit.Any, v)
+		}
+	}
+	return ctx
+}
+
 var ignoreErrorFunc = func(error) error { return nil }
 
-func WithTransaction(ctx context.Context) (txCtx context.Context, endTx func(err error) error, err error) {
+func WithTransaction(ctx context.Context) (
+	txCtx context.Context,
+	endTx func(err error) error,
+	err error,
+) {
 	txer, ok := ctxutil.Value(ctx, (*sqlTxer)(nil)).(sqlTxer)
 	if !ok {
-		return ctx, ignoreErrorFunc, fmt.Errorf("no %T in context", txer)
+		return ctx, ignoreErrorFunc, fmt.Errorf(
+			"no %v in context",
+			reflect.TypeOf(&txer).Elem().Name(),
+		)
 	}
 	tx, err := txer.BeginTx(ctx, nil)
 	if err != nil {
-		return ctx, ignoreErrorFunc, fmt.Errorf("beginning transaction: %w", err)
+		return ctx, ignoreErrorFunc, fmt.Errorf(
+			"beginning transaction: %w", err,
+		)
 	}
-	return ctxutil.WithValue(ctx, (*sql.Tx)(nil), tx), func(err error) error {
+	txCtx = addToContextWithSQLInterfaces(
+		ctxutil.WithValue(ctx, (*sql.Tx)(nil), tx),
+		tx,
+	)
+	endTx = func(err error) error {
 		if err == nil {
 			if err = tx.Commit(); err != nil {
 				return fmt.Errorf(
@@ -115,7 +159,9 @@ func WithTransaction(ctx context.Context) (txCtx context.Context, endTx func(err
 			tx, err,
 		)
 		return err
-	}, nil
+	}
+	err = nil
+	return
 }
 
 var _ = []interface {
@@ -144,24 +190,46 @@ func (f shouldPreparerFunc) shouldPrepare(ctx context.Context, q query) bool { r
 // WithNeverPrepare configures a DB to never prepare its queries
 func WithNeverPrepare() DBOption {
 	return dbOptionFunc(func(db *DB) error {
-		db.shouldPreparer = shouldPreparerFunc(func(ctx context.Context, q query) bool {
-			return false
-		})
+		db.shouldPreparer = shouldPreparerFunc(
+			func(ctx context.Context, q query) bool {
+				return false
+			},
+		)
 		return nil
 	})
 }
 
 type shouldPrepareAfterCount struct{ count int32 }
 
-func (sp shouldPrepareAfterCount) shouldPrepare(ctx context.Context, q query) bool {
+func (sp shouldPrepareAfterCount) shouldPrepare(
+	ctx context.Context,
+	q query,
+) bool {
 	if pqr, ok := q.(interface{ preparedQuery() *preparedQuery }); ok {
 		pq := pqr.preparedQuery()
-		// load w/o increment in so we don't roll over int32 in
-		// long-running processes
-		if atomic.LoadInt32(&pq.executionCount) >= sp.count {
-			return false // already prepared
+		const maxSpins = 1024
+		for i := 0; i < maxSpins; i++ {
+			// slower separate load & cas so the query
+			// count doesn't roll over in a long-running
+			// process:
+			loadedExecutionCount := atomic.LoadInt32(&pq.executionCount)
+			if loadedExecutionCount >= sp.count {
+				return false // already prepared
+			}
+			incrementedExecutionCount := loadedExecutionCount + 1
+			if atomic.CompareAndSwapInt32(
+				&pq.executionCount,
+				loadedExecutionCount,
+				incrementedExecutionCount,
+			) {
+				return incrementedExecutionCount == sp.count
+			}
 		}
-		return atomic.AddInt32(&pq.executionCount, 1) == sp.count
+		logger.Error3(
+			"%#v.%s unable to increment execution count "+
+				"after %d tries",
+			sp, unsafereflect.CallerName(0, nil), maxSpins,
+		)
 	}
 	return false
 }
@@ -197,10 +265,11 @@ type dbInfoOptionFunc func(dbi *DBInfo) error
 
 func (f dbInfoOptionFunc) applyOptionToDBInfo(dbi *DBInfo) error { return f(dbi) }
 
-type dbDBInfoOptionFunc dbInfoOptionFunc
+type dbDBInfoSQLWriterOptionFunc dbInfoOptionFunc
 
-func (f dbDBInfoOptionFunc) applyOptionToDB(db *DB) error          { return f(db.info) }
-func (f dbDBInfoOptionFunc) applyOptionToDBInfo(dbi *DBInfo) error { return f(dbi) }
+func (f dbDBInfoSQLWriterOptionFunc) applyOptionToDB(db *DB) error               { return f(db.info) }
+func (f dbDBInfoSQLWriterOptionFunc) applyOptionToDBInfo(dbi *DBInfo) error      { return f(dbi) }
+func (f dbDBInfoSQLWriterOptionFunc) applyOptionToSQLWriter(sw *sqlWriter) error { return f(sw.dbInfo) }
 
 // WithSQLDB sets the DB's wrapped *sql.DB
 func WithSQLDB(sqlDB *sql.DB) DBOption {
@@ -230,11 +299,26 @@ func NewDB(options ...DBOption) (*DB, error) {
 	return db, nil
 }
 
+func DBFromContext(ctx context.Context) (*DB, error) {
+	db, ok := ctxutil.Value(ctx, (*DB)(nil)).(*DB)
+	if !ok {
+		return nil, errDBNotFound
+	}
+	return db, nil
+}
+
 func (db *DB) init() {
 	// defaults:
 	if db.shouldPreparer == nil {
 		db.shouldPreparer = shouldPrepareAfterCount{count: 2}
 	}
+}
+
+func (db *DB) AddToContext(ctx context.Context) context.Context {
+	return addToContextWithSQLInterfaces(
+		ctxutil.WithValue(ctx, (*DB)(nil), db),
+		db.SQLDB(),
+	)
 }
 
 // SQLDB gets the *sql.DB that this DB wraps,
@@ -248,7 +332,30 @@ type DBInfo struct {
 	sqlTables     sync.Map // map[*modelType]*sqlddl.Table
 }
 
+func NewDBInfo(options ...DBInfoOption) (*DBInfo, error) {
+	dbi := &DBInfo{
+		ArgWriterTo:  odbcArgWriterTo{},
+		ExprWriterTo: defaultExprWriterTo{},
+		SQLWriterTo:  defaultSQLWriterTo{},
+		NameWritersTo: NameWritersTo{
+			Column: SnakeCaseLower,
+			Table:  SnakeCaseLower,
+			Schema: SnakeCaseLower,
+		},
+	}
+	for i, opt := range options {
+		if err := opt.applyOptionToDBInfo(dbi); err != nil {
+			return nil, fmt.Errorf(
+				"applying option %d (%#v): %w",
+				i, opt, err,
+			)
+		}
+	}
+	return dbi, nil
+}
+
 var (
+	errDBNotFound          = fmt.Errorf("*DB %w", expr.ErrNotFound)
 	errDBInfoNotFound      = fmt.Errorf("*DBInfo %w", expr.ErrNotFound)
 	errDBInfoNotFoundInCtx = fmt.Errorf("%w in context", errDBInfoNotFound)
 )
@@ -258,45 +365,29 @@ func DBInfoFromContext(ctx context.Context) (dbi *DBInfo, ok bool) {
 	return
 }
 
-func WithDBInfo(dbi *DBInfo) DBOption {
-	return dbOptionFunc(func(db *DB) error {
-		db.info = dbi
-		return nil
-	})
+type withDBInfoOption struct {
+	dbi *DBInfo
+}
+
+func (opt withDBInfoOption) applyOptionToDB(db *DB) error {
+	db.info = opt.dbi
+	return nil
+}
+
+func (opt withDBInfoOption) applyOptionToSQLWriter(sw *sqlWriter) error {
+	sw.dbInfo = opt.dbi
+	return nil
+}
+
+func WithDBInfo(dbi *DBInfo) interface {
+	DBOption
+	SQLWriterOption
+} {
+	return withDBInfoOption{dbi}
 }
 
 func (dbi *DBInfo) AddToContext(ctx context.Context) context.Context {
 	return ctxutil.WithValue(ctx, (*DBInfo)(nil), dbi)
-}
-
-func (dbi *DBInfo) getArgWriterTo() ArgWriterTo {
-	if dbi.ArgWriterTo == nil {
-		dbi.ArgWriterTo = odbcArgWriterTo{}
-	}
-	return dbi.ArgWriterTo
-}
-
-func (dbi *DBInfo) getExprWriterTo() ExprWriterTo {
-	if dbi.ExprWriterTo == nil {
-		dbi.ExprWriterTo = defaultExprWriterTo{}
-	}
-	return dbi.ExprWriterTo
-}
-
-func (dbi *DBInfo) getSQLWriterTo() SQLWriterTo {
-	if dbi.SQLWriterTo == nil {
-		dbi.SQLWriterTo = defaultSQLWriterTo{}
-	}
-	return dbi.SQLWriterTo
-}
-
-func (dbi *DBInfo) MakeSQLWriter(ctx context.Context, w io.Writer) (SQLWriter, error) {
-	if sw, ok := w.(SQLWriter); ok {
-		return sw, nil
-	}
-	sw := &sqlWriter{}
-	sw.init(dbi, w)
-	return sw, nil
 }
 
 func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
@@ -335,7 +426,7 @@ func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
 			c := &arg.t.Columns[f.index]
 			*c = sqlddl.Column{
 				ColumnName: sqlddl.ColumnName{
-					TableName: t.TableName,
+					TableName: arg.t.TableName,
 					Name:      f.sqlName,
 				},
 				Type: f.sqlType,
@@ -343,7 +434,7 @@ func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
 			if c.ColumnName.Name == "" {
 				createName(
 					f.rawName,
-					&dbi.NameWritersTo.Column,
+					&arg.dbi.NameWritersTo.Column,
 					&c.ColumnName.Name,
 				)
 			}

@@ -92,60 +92,88 @@ type SQLWriter interface {
 	WriteSQL(context.Context, sqllang.Node) (int64, error)
 }
 
+type SQLWriterOption interface {
+	applyOptionToSQLWriter(*sqlWriter) error
+}
+
+type sqlWriterOptionFunc func(sw *sqlWriter) error
+
+func (f sqlWriterOptionFunc) applyOptionToSQLWriter(sw *sqlWriter) error {
+	return f(sw)
+}
+
+func NewSQLWriter(w io.Writer, options ...SQLWriterOption) (SQLWriter, error) {
+	sw := &sqlWriter{
+		w:    smallWriterCounter{smallWriter: SmallWriterOf(w)},
+		args: make([]interface{}, 0, arbitraryCapacity),
+	}
+	var err error
+	if sw.dbInfo, err = NewDBInfo(); err != nil {
+		return nil, fmt.Errorf(
+			"initializing %T.%T: %w",
+			sw, sw.dbInfo, err,
+		)
+	}
+	for i, opt := range options {
+		if err = opt.applyOptionToSQLWriter(sw); err != nil {
+			return nil, fmt.Errorf(
+				"applying option %d (%#v) to %T: %w",
+				i, opt, sw, err,
+			)
+		}
+	}
+	return sw, nil
+}
+
 // sqlWriter is the default SQLWriter implementation that uses
 // an ArgWriterTo, ExprWriterTo, and SQLWriterTo to generate SQL.
 type sqlWriter struct {
-	w            smallWriterCounter
-	dbInfo       *DBInfo
-	args         []interface{}
-	columnNameOf func(m expr.Mem) (string, error)
+	w      smallWriterCounter
+	dbInfo *DBInfo
+	args   []interface{}
+}
+
+func (sw *sqlWriter) columnNameOf(m expr.Mem) (string, error) {
+	q, ok := m[0].(query)
+	if !ok {
+		return "", fmt.Errorf(
+			"cannot get member of non-query: %v (type: %[1]T)",
+			m[0],
+		)
+	}
+	e, ok := m[1].(*reflect.StructField)
+	if !ok {
+		return "", fmt.Errorf(
+			"cannot get non-struct field (%[1]v (type: %[1]T) of query %v",
+			e, q,
+		)
+	}
+	tq, _ := tableQueryOf(q)
+	mt := tq.modelType
+	fieldIndex := func() int {
+		for i := range mt.structFields {
+			for _, fp := range mt.structFields[i].urFieldPath {
+				if &fp.urType.ReflectStructFields()[fp.fieldIndex] == e {
+					return i
+				}
+			}
+		}
+		return -1
+	}()
+	if fieldIndex == -1 {
+		return "", fmt.Errorf(
+			"failed to find member %v of %v",
+			e.Name,
+			tq.modelType.unsafereflectType.ReflectType().Name(),
+		)
+	}
+	sqlTable := sw.dbInfo.sqlTableOf(mt)
+	return sqlTable.Columns[fieldIndex].ColumnName.Name, nil
 }
 
 var _ interface {
 	SQLWriter
 } = (*sqlWriter)(nil)
-
-func (sw *sqlWriter) init(dbi *DBInfo, w io.Writer) {
-	sw.dbInfo = dbi
-	sw.w.smallWriter = SmallWriterOf(w)
-	sw.columnNameOf = func(m expr.Mem) (string, error) {
-		q, ok := m[0].(query)
-		if !ok {
-			return "", fmt.Errorf(
-				"cannot get member of non-query: %v (type: %[1]T)",
-				m[0],
-			)
-		}
-		e, ok := m[1].(*reflect.StructField)
-		if !ok {
-			return "", fmt.Errorf(
-				"cannot get non-struct field (%[1]v (type: %[1]T) of query %v",
-				e, q,
-			)
-		}
-		tq, _ := tableQueryOf(q)
-		mt := tq.modelType
-		fieldIndex := func() int {
-			for i := range mt.structFields {
-				for _, fp := range mt.structFields[i].urFieldPath {
-					if &fp.urType.ReflectStructFields()[fp.fieldIndex] == e {
-						return i
-					}
-				}
-			}
-			return -1
-		}()
-		if fieldIndex == -1 {
-			return "", fmt.Errorf(
-				"failed to find member %v of %v",
-				e.Name,
-				tq.modelType.unsafereflectType.ReflectType().Name(),
-			)
-		}
-		sqlTable := sw.dbInfo.sqlTableOf(mt)
-		return sqlTable.Columns[fieldIndex].ColumnName.Name, nil
-	}
-}
 
 //type sqlWriterOptionFunc func(*sqlWriter) error
 
@@ -157,8 +185,9 @@ func (sw *sqlWriter) init(dbi *DBInfo, w io.Writer) {
 func WithArgWriterTo(awt ArgWriterTo) interface {
 	DBOption
 	DBInfoOption
+	SQLWriterOption
 } {
-	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+	return dbDBInfoSQLWriterOptionFunc(func(dbi *DBInfo) error {
 		dbi.ArgWriterTo = awt
 		return nil
 	})
@@ -168,8 +197,9 @@ func WithArgWriterTo(awt ArgWriterTo) interface {
 func WithExprWriterTo(ewt ExprWriterTo) interface {
 	DBOption
 	DBInfoOption
+	SQLWriterOption
 } {
-	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+	return dbDBInfoSQLWriterOptionFunc(func(dbi *DBInfo) error {
 		dbi.ExprWriterTo = ewt
 		return nil
 	})
@@ -179,9 +209,45 @@ func WithExprWriterTo(ewt ExprWriterTo) interface {
 func WithSQLWriterTo(swt SQLWriterTo) interface {
 	DBOption
 	DBInfoOption
+	SQLWriterOption
 } {
-	return dbDBInfoOptionFunc(func(dbi *DBInfo) error {
+	return dbDBInfoSQLWriterOptionFunc(func(dbi *DBInfo) error {
 		dbi.SQLWriterTo = swt
+		return nil
+	})
+}
+
+func WithSQLLangVisitorWrapper(wrap func(
+	w SmallWriter,
+	inner sqllang.Visitor,
+) (
+	sqllang.Visitor,
+	error,
+)) interface {
+	DBOption
+	DBInfoOption
+	SQLWriterOption
+} {
+	return dbDBInfoSQLWriterOptionFunc(func(dbi *DBInfo) error {
+		dbi.SQLWriterTo = sqlWriterToFunc(func(
+			ctx context.Context,
+			w SmallWriter,
+			ewt ExprWriterTo,
+			awt ArgWriterTo,
+			currentArgs []interface{},
+			columnNameOf func(m expr.Mem) (string, error),
+			node sqllang.Node,
+		) (
+			newArgs []interface{},
+			written int64,
+			err error,
+		) {
+			return wrapSQLWriterToVisitor(
+				ctx, w, ewt, awt, currentArgs,
+				columnNameOf, node,
+				wrap,
+			)
+		})
 		return nil
 	})
 }
@@ -189,16 +255,16 @@ func WithSQLWriterTo(swt SQLWriterTo) interface {
 func (sw *sqlWriter) Args() []interface{} { return sw.args }
 
 func (sw *sqlWriter) WriteArg(ctx context.Context, arg interface{}) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.getArgWriterTo().WriteArgTo(ctx, &sw.w, sw.args, arg)
+	sw.args, n, err = sw.dbInfo.ArgWriterTo.WriteArgTo(ctx, &sw.w, sw.args, arg)
 	return
 }
 
 func (sw *sqlWriter) WriteExpr(ctx context.Context, e expr.Expr) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.getExprWriterTo().WriteExprTo(
+	sw.args, n, err = sw.dbInfo.ExprWriterTo.WriteExprTo(
 		ctx,
 		&sw.w,
-		sw.dbInfo.getSQLWriterTo(),
-		sw.dbInfo.getArgWriterTo(),
+		sw.dbInfo.SQLWriterTo,
+		sw.dbInfo.ArgWriterTo,
 		sw.args,
 		sw.columnNameOf,
 		e,
@@ -207,11 +273,11 @@ func (sw *sqlWriter) WriteExpr(ctx context.Context, e expr.Expr) (n int64, err e
 }
 
 func (sw *sqlWriter) WriteSQL(ctx context.Context, s sqllang.Node) (n int64, err error) {
-	sw.args, n, err = sw.dbInfo.getSQLWriterTo().WriteSQLTo(
+	sw.args, n, err = sw.dbInfo.SQLWriterTo.WriteSQLTo(
 		ctx,
 		&sw.w,
-		sw.dbInfo.getExprWriterTo(),
-		sw.dbInfo.getArgWriterTo(),
+		sw.dbInfo.ExprWriterTo,
+		sw.dbInfo.ArgWriterTo,
 		sw.args,
 		sw.columnNameOf,
 		s,
@@ -459,6 +525,71 @@ type defaultSQLWriterTo struct{}
 
 var _ SQLWriterTo = defaultSQLWriterTo{}
 
+type sqlWriterToFunc func(
+	ctx context.Context,
+	w SmallWriter,
+	ewt ExprWriterTo,
+	awt ArgWriterTo,
+	currentArgs []interface{},
+	columnNameOf func(m expr.Mem) (string, error),
+	node sqllang.Node,
+) (
+	newArgs []interface{},
+	written int64,
+	err error,
+)
+
+func (f sqlWriterToFunc) WriteSQLTo(
+	ctx context.Context,
+	w SmallWriter,
+	ewt ExprWriterTo,
+	awt ArgWriterTo,
+	currentArgs []interface{},
+	columnNameOf func(m expr.Mem) (string, error),
+	node sqllang.Node,
+) (
+	newArgs []interface{},
+	written int64,
+	err error,
+) {
+	return f(ctx, w, ewt, awt, currentArgs, columnNameOf, node)
+}
+
+func wrapSQLWriterToVisitor(
+	ctx context.Context,
+	w SmallWriter,
+	ewt ExprWriterTo,
+	awt ArgWriterTo,
+	currentArgs []interface{},
+	columnNameOf func(m expr.Mem) (string, error),
+	node sqllang.Node,
+	wrap func(SmallWriter, sqllang.Visitor) (sqllang.Visitor, error),
+) (
+	newArgs []interface{},
+	written int64,
+	err error,
+) {
+	swc := smallWriterCounterOf(w)
+	start := swc.written
+	dwv := &defaultSQLWriterVisitor{
+		w:            swc,
+		argWriterTo:  awt,
+		exprWriterTo: ewt,
+		sqlWriterTo:  defaultSQLWriterTo{},
+		columnNameOf: columnNameOf,
+		args:         currentArgs,
+	}
+	v, err := wrap(swc, dwv)
+	if err != nil {
+		return nil, 0, fmt.Errorf(
+			"wrapping %v: %w",
+			dwv, err,
+		)
+	}
+	err = sqllang.Walk(ctx, node, v)
+	return dwv.args, swc.written - start, err
+}
+
 func (swt defaultSQLWriterTo) WriteSQLTo(
 	ctx context.Context,
 	w SmallWriter,
@@ -472,20 +603,12 @@ func (swt defaultSQLWriterTo) WriteSQLTo(
 	written int64,
 	err error,
 ) {
-	swc := smallWriterCounterOf(w)
-	start := swc.written
-	v := &defaultSQLWriterVisitor{
-		w:            swc,
-		argWriterTo:  awt,
-		exprWriterTo: ewt,
-		sqlWriterTo:  swt,
-		columnNameOf: columnNameOf,
-		args:         currentArgs,
-	}
-	err = sqllang.Walk(ctx, node, v)
-	written = swc.written - start
-	newArgs = v.args
-	return
+	return wrapSQLWriterToVisitor(
+		ctx, w, ewt, awt, currentArgs, columnNameOf, node,
+		func(sw SmallWriter, v sqllang.Visitor) (sqllang.Visitor, error) {
+			return v, nil
+		},
+	)
 }
 
 type defaultSQLWriterVisitor struct {

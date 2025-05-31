@@ -13,11 +13,14 @@ import (
 	"unicode/utf8"
 	"unsafe"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/skillian/ctxutil"
 	"github.com/skillian/expr"
 	"github.com/skillian/expr/stream"
+	"github.com/skillian/logging"
 	"github.com/skillian/sqlstream/sqllang"
 	sqlddl "github.com/skillian/sqlstream/sqllang/ddl"
+	"github.com/skillian/unsafereflect"
 )
 
 // Query creates a `stream.Streamer“ that essentially starts as a
@@ -183,7 +186,7 @@ func (pq *preparedQuery) executeQuery(ctx context.Context, q query) (_ stream.St
 func (pq *preparedQuery) getOrCreateData(ctx context.Context, dbi *DBInfo, q query) (*pqData, error) {
 	pqd, ok := pq.data()[dbi]
 	if !ok {
-		sn, modelTypes, err := createSQLNodeFromQuery(ctx, dbi, q)
+		sn, err := createSQLNodeFromQuery(ctx, dbi, q)
 		if err != nil {
 			// TODO: Sticky err on pqData?
 			return nil, fmt.Errorf(
@@ -192,7 +195,7 @@ func (pq *preparedQuery) getOrCreateData(ctx context.Context, dbi *DBInfo, q que
 			)
 		}
 		sb := strings.Builder{}
-		swr, err := dbi.MakeSQLWriter(ctx, &sb)
+		swr, err := NewSQLWriter(&sb, WithDBInfo(dbi))
 		if err != nil {
 			return nil, fmt.Errorf(
 				"creating SQLWriter: %w", err,
@@ -210,8 +213,15 @@ func (pq *preparedQuery) getOrCreateData(ctx context.Context, dbi *DBInfo, q que
 				query:          sb.String(),
 				args:           swr.Args(),
 				executionCount: 0,
-				modelTypes:     modelTypes,
 			}},
+		}
+		if sel, ok := sn.(*sqllang.Select); !ok {
+			logger.Warn3(
+				"%[1]s expected SQL node to be %[2]T, "+
+					"not %[3]v (%[3]T)",
+				unsafereflect.CallerName(0, nil),
+				sel, sn,
+			)
 		}
 		pq.getOrAddData(getOrAdded[:])
 		pqd = getOrAdded[0].Value
@@ -222,8 +232,8 @@ func (pq *preparedQuery) getOrCreateData(ctx context.Context, dbi *DBInfo, q que
 type pqData struct {
 	query          string
 	unsafeStmtData *sqlStmtData
-	args           []interface{}
 	modelTypes     []*modelType
+	args           []interface{}
 	executionCount int32
 }
 
@@ -265,11 +275,7 @@ func (pqd *pqData) executeQuery(
 	// 3. sqlQuerier
 	stmtData := pqd.stmtData()
 	if stmtData == nil {
-		if db, ok := ctxutil.Value(
-			ctx, (*DB)(nil),
-		).(*DB); ok && db.shouldPreparer.shouldPrepare(
-			ctx, q,
-		) {
+		if db, err := DBFromContext(ctx); err == nil && db.shouldPreparer.shouldPrepare(ctx, q) {
 			sqlDB := db.SQLDB()
 			stmt, err := sqlDB.PrepareContext(
 				ctx, pqd.query,
@@ -380,15 +386,10 @@ type sqlStmtData struct {
 }
 
 func createStreamFromRows(q query, modelTypes []*modelType, rows sqlRows, rowsCloser func() error) (stream.Stream, error) {
-	columns := 0
-	for _, mt := range modelTypes {
-		columns += len(mt.columnNames)
-	}
 	return &rowsStream{
-		query:      q,
-		modelTypes: modelTypes,
+		q:          q,
 		rows:       rows,
-		values:     make([]interface{}, 0, columns),
+		modelTypes: modelTypes,
 		rowsCloser: rowsCloser,
 	}, nil
 }
@@ -398,38 +399,43 @@ type sqlNodeGenerator struct {
 	q           query
 	t           queryJoinTree
 	sourceStack []*sqllang.Source
-
-	modelTypes []*modelType
+	selection   expr.Expr
 }
 
 func (sng *sqlNodeGenerator) topSrc(indexFromTop int) *sqllang.Source {
 	return sng.sourceStack[len(sng.sourceStack)-indexFromTop-1]
 }
 
-func createSQLNodeFromQuery(ctx context.Context, dbi *DBInfo, q query) (sn sqllang.Node, modelTypes []*modelType, err error) {
+func createSQLNodeFromQuery(ctx context.Context, dbi *DBInfo, q query) (sn sqllang.Node, err error) {
 	sng := sqlNodeGenerator{
 		dbi: dbi,
 		q:   q,
 		t: queryJoinTree{
 			nodes:   make([]queryJoinTreeNode, 0, arbitraryCapacity),
-			queries: make([]query, 0, arbitraryCapacity*arbitraryCapacity),
+			// set root of the tree to nil
+			queries: make([]query, 1, arbitraryCapacity*arbitraryCapacity),
 		},
 		sourceStack: make([]*sqllang.Source, 1, arbitraryCapacity),
 	}
-	sng.t.init(q, 0, -1)
+	sng.t.init(q, 0)
 	src := &sqllang.Source{}
 	sng.sourceStack[0] = src
 	err = sng.initSQLSourceFromQueryTree(ctx, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"initializing SQL source node %v: %w",
 			sng, err,
 		)
 	}
-	if src.Select != nil {
-		return src.Select, sng.modelTypes, nil
+	if src.Select == nil {
+		logger.Warn2(
+			"expected query generation to generate a %T, "+
+				"not just %T",
+			src.Select, src,
+		)
+		return src, nil
 	}
-	return src, sng.modelTypes, nil
+	return src.Select, nil
 }
 
 func (sng *sqlNodeGenerator) initSQLSourceFromQueryTree(ctx context.Context, queryJoinTreeIndex int) error {
@@ -495,6 +501,24 @@ func (sng *sqlNodeGenerator) initSQLSourceFromQueryTree(ctx context.Context, que
 			sel.Where = sqllang.Where{}
 		}
 	}
+	// appendQueryColumns appends all of the columns in the
+	// tableQuery to the select's columns.  Use this if q has no
+	// *mapQuery
+	appendQueryColumns := func(sel *sqllang.Select, tq *tableQuery, q query) {
+		va := tq.Var()
+		urt := tq.modelType.unsafereflectType
+		modelPtr := reflect.New(urt.ReflectType()).Interface()
+		t := sng.dbi.sqlTableOf(tq.modelType)
+		for i := range t.Columns {
+			fieldPtr := urt.FieldPointer(modelPtr, i)
+			sel.Columns = append(
+				sel.Columns,
+				sqllang.Column{
+					Expr: expr.MemOf(va, modelPtr, fieldPtr),
+				},
+			)
+		}
+	}
 	src := sng.topSrc(0)
 	elem := sng.t.nodes[queryJoinTreeIndex]
 	for _, q := range sng.t.queries[elem.firstChild : elem.firstChild+elem.children] {
@@ -519,11 +543,22 @@ func (sng *sqlNodeGenerator) initSQLSourceFromQueryTree(ctx context.Context, que
 			if err := sng.initSQLSourceFromQueryTree(
 				ctx, queryJoinTreeIndex+1,
 			); err != nil {
-				return err
+				return fmt.Errorf(
+					"initializing SQL source from join %v: %w",
+					q, err,
+				)
 			}
 			demoteToSource(src.Select, joinSrc)
 		case *mapQuery:
-			panic("// TODO: implement *mapQuery")
+			return fmt.Errorf(
+				"query mappings are not supported: " +
+					"What does it mean to apply a " +
+					"mapping before scanning " +
+					"results into a struct- the " +
+					"types wouldn't map properly. " +
+					"Please provide a use case to " +
+					"the support team.",
+			)
 		case *sortQuery:
 			sel := promoteToSelect(src)
 			sel.OrderBy = append(sel.OrderBy, sqllang.Sort{
@@ -531,51 +566,52 @@ func (sng *sqlNodeGenerator) initSQLSourceFromQueryTree(ctx context.Context, que
 				Desc: q.descending,
 			})
 		case *tableQuery:
-			sng.modelTypes = append(sng.modelTypes, q.modelType)
+			if sng.selection == nil {
+				sng.selection = q.Var()
+			}
 			sqlTable := sng.dbi.sqlTableOf(q.modelType)
+			initsrc := src
 			if queryJoinTreeIndex == 0 || src.Select != nil {
-				if err := initSQLSelectFromTableQuery(
-					promoteToSelect(src), q,
-					sqlTable,
-				); err != nil {
-					return err
-				}
-			} else if _, ok := sng.t.queries[elem.query].(*joinQuery); ok {
-				if err := appendSQLSelectColumns(
-					sng.sourceStack[0].Select, q,
-					sqlTable,
-				); err != nil {
-					return err
-				}
-			} else {
-				if err := initSQLSourceTableAndAliasFromTableQuery(
-					src, q, sqlTable,
-				); err != nil {
-					return err
-				}
+				initsrc = &promoteToSelect(src).From
+			}
+			if err := initSQLSourceTableAndAliasFromTableQuery(
+				initsrc, q, sqlTable,
+			); err != nil {
+				return err
 			}
 		}
 	}
-	return nil
-}
-
-func appendSQLSelectColumns(sel *sqllang.Select, q *tableQuery, sqlTable *sqlddl.Table) error {
-	ddlCols := sqlTable.Columns
-	t := reflect.New(q.modelType.unsafereflectType.ReflectType()).Interface()
-	for i := range ddlCols {
-		f := q.modelType.unsafereflectType.FieldPointer(t, i)
-		sel.Columns = append(sel.Columns, sqllang.Column{
-			Expr: expr.MemOf(q, t, f),
-		})
+	if src.Select == nil {
+		logger.Warn3(
+			"%v expected to return a %T, not %T",
+			unsafereflect.CallerName(0, nil),
+			src.Select, src,
+		)
+		return nil
+	}
+	if logger.Level() <= logging.DebugLevel {
+		list := strings.Builder{}
+		for _, q := range sng.t.queries {
+			list.WriteByte('\n')
+			dumpQuery(&list, q)
+		}
+		logger.Debug1(
+			"queries: %v",
+			list.String(),
+		)
+	}
+	for _, qtn := range sng.t.nodes {
+		logger.Debug1(
+			"qtn: %v",
+			spew.Sdump(qtn),
+		)
+		appendQueryColumns(
+			promoteToSelect(src),
+			sng.t.queries[qtn.firstChild].(*tableQuery),
+			sng.t.queries[qtn.firstChild+qtn.children-1],
+		)
 	}
 	return nil
-}
-
-func initSQLSelectFromTableQuery(sel *sqllang.Select, q *tableQuery, sqlTable *sqlddl.Table) error {
-	if err := appendSQLSelectColumns(sel, q, sqlTable); err != nil {
-		return fmt.Errorf("appending SQL Select from tableQuery: %w", err)
-	}
-	return initSQLSourceTableAndAliasFromTableQuery(&sel.From, q, sqlTable)
 }
 
 func initSQLSourceTableAndAliasFromTableQuery(src *sqllang.Source, q *tableQuery, sqlTable *sqlddl.Table) error {
@@ -603,7 +639,7 @@ type queryJoinTree struct {
 	queries []query
 }
 
-func (t *queryJoinTree) init(q query, queryIndex, parentIndex int) {
+func (t *queryJoinTree) init(q query, parentIndex int) {
 	start := len(t.queries)
 	t.queries = appendQueryComponents(t.queries, q)
 	end := len(t.queries)
@@ -614,40 +650,35 @@ func (t *queryJoinTree) init(q query, queryIndex, parentIndex int) {
 		t.queries[start+i], t.queries[end-1-i] = t.queries[end-1-i], t.queries[start+i]
 	}
 	t.nodes = append(t.nodes, queryJoinTreeNode{
-		query:      queryIndex,
 		parent:     parentIndex,
 		firstChild: start,
 		children:   end - start,
 	})
-	for i, q := range t.queries[start:end] {
+	for _, q := range t.queries[start:end] {
 		if jq, ok := q.(*joinQuery); ok {
 			if Debug {
 				for _, q2 := range t.queries {
 					if q == q2 {
 						panic(fmt.Errorf(
-							"recursive query detected: %v has already been added to the query tree: %#v",
+							"query cycle detected: %v has already been added to the query tree: %#v",
 							q, t.queries,
 						))
 					}
 				}
 			}
-			t.init(jq.to, start+i, queryIndex)
+			t.init(jq.to, start)
 		}
 	}
 }
 
 type queryJoinTreeNode struct {
-	// query is the index of the query object for this node
-	// in the tree's nodes list
-	query int
-
 	// index of the parent of this join node.
 	parent int
 
 	// firstChild is the index of the first child of this query
 	firstChild int
 
-	// children is the
+	// children is the number of child nodes under this query
 	children int
 }
 
@@ -801,7 +832,7 @@ func (q *joinQuery) Var() expr.Var { return q }
 type mapQuery struct {
 	from     query
 	prepared preparedQuery
-	mapping  expr.Expr
+	mapping  expr.Tuple
 	name     atomicString
 }
 
@@ -864,17 +895,24 @@ func appendQueryComponents(components []query, q query) []query {
 }
 
 func stringsCutTrimSpace(s string) (prefix, suffix string, ok bool) {
-	i := strings.IndexFunc(s, unicode.IsSpace)
+	i := strings.IndexFunc(s, func(r rune) bool {
+		return !unicode.IsSpace(r)
+	})
 	if i == -1 {
 		return s, "", false
 	}
-	j := strings.IndexFunc(s[i:], func(r rune) bool {
+	s = s[i:]
+	j := strings.IndexFunc(s, unicode.IsSpace)
+	if j == -1 {
+		return s, "", false
+	}
+	k := strings.IndexFunc(s[j:], func(r rune) bool {
 		return !unicode.IsSpace(r)
 	})
-	if j == -1 {
-		return s[:i], "", true
+	if k == -1 {
+		return s[:j], "", true
 	}
-	return s[:i], s[i+j:], true
+	return s[:j], s[j+k:], true
 }
 
 // getOrAppendSQLArgs returns queryArgs if none of queryArgs' elements
@@ -924,9 +962,9 @@ func getOrAppendSQLArgs(ctx context.Context, appendToArgs, queryArgs []interface
 }
 
 type rowsStream struct {
-	query      query
-	modelTypes []*modelType
+	q          query
 	rows       sqlRows
+	modelTypes []*modelType
 	values     []interface{}
 	rowsCloser func() error
 }
@@ -949,20 +987,11 @@ func (rs *rowsStream) Next(ctx context.Context) (err error) {
 			rs, va, vs, err,
 		)
 	}
+	rs.values = rs.values[:0]
 	t, ok := v.(expr.Tuple)
 	if !ok {
-		if len(rs.modelTypes) != 1 {
-			return fmt.Errorf(
-				"result set has a sequence of "+
-					"model types, but bound model "+
-					"%[1]v (type: %[1]T) is not a "+
-					"tuple",
-				v,
-			)
-		}
 		t = expr.Tuple{v}
 	}
-	rs.values = rs.values[:0]
 	for i, mt := range rs.modelTypes {
 		rs.values = mt.AppendFieldPointers(rs.values, t[i])
 	}
@@ -975,7 +1004,7 @@ func (rs *rowsStream) Next(ctx context.Context) (err error) {
 	return nil
 }
 
-func (rs *rowsStream) Var() expr.Var { return rs.query.Var() }
+func (rs *rowsStream) Var() expr.Var { return rs.q.Var() }
 
 func (rs *rowsStream) Close() error {
 	errs := [...]error{
@@ -983,4 +1012,36 @@ func (rs *rowsStream) Close() error {
 		rs.rowsCloser(),
 	}
 	return errors.Join(errs[:]...)
+}
+
+func dumpQuery(sw SmallWriter, q query) (err error) {
+	if q == nil {
+		_, err = sw.WriteString("<nil>")
+		return
+	}
+	if err = sw.WriteByte('*'); err != nil {
+		return
+	}
+	if _, err = sw.WriteString(reflect.TypeOf(q).Elem().Name()); err != nil {
+		return
+	}
+	if err = sw.WriteByte('{'); err != nil {
+		return
+	}
+	switch q := q.(type) {
+	case *tableQuery:
+		if _, err = sw.WriteString(q.modelType.rawName.Name); err != nil {
+			return
+		}
+	case *filterQuery:
+		if _, err = sw.WriteString(fmt.Sprint(q.filter)); err != nil {
+			return
+		}
+	default:
+		if _, err = sw.WriteString(fmt.Sprintf("%v", q)); err != nil {
+			return
+		}
+	}
+	err = sw.WriteByte('}')
+	return
 }

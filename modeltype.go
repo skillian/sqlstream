@@ -171,10 +171,7 @@ func splitGoNameNoAcronyms(name string, arg interface{}, fn func(arg interface{}
 			start = i
 		}
 	}
-	// if start != noStart {
 	return fn(arg, name[start:])
-	// }
-	return nil
 }
 
 func modelTypeOfReflectType(rt reflect.Type) *modelType {
