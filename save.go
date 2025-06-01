@@ -21,6 +21,35 @@ func saveOne(ctx context.Context, dbi *DBInfo, v interface{}, options ...SaveOpt
 	}
 }
 
+type SaveOption interface {
+	applySaveOption(*saveConfig) error
+}
+
+type saveOptionFunc func(*saveConfig) error
+
+func (f saveOptionFunc) applySaveOption(c *saveConfig) error {
+	return f(c)
+}
+
+type saveConfig struct {
+	flags saveFlags
+}
+
+type saveFlags
+
+const (
+	saveFlagCreate = 1 << iota
+)
+
+// WithCreateIfNotExist configures a save operation to create something
+// if it does not already exist.
+func WithCreateIfNotExist() SaveOption {
+	return saveOptionFunc(func(c *saveConfig) error {
+		c.flags |= saveFlagCreate
+		return nil
+	})
+}
+
 func emptyInterfacesOf(v interface{}) []interface{} {
 	if vs, ok := v.([]interface{}); ok {
 		return vs
