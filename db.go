@@ -329,8 +329,19 @@ type DBInfo struct {
 	ExprWriterTo  ExprWriterTo
 	SQLWriterTo   SQLWriterTo
 	NameWritersTo NameWritersTo
-	sqlTables     sync.Map // map[*modelType]*sqlddl.Table
+	sqlTables     sync.Map // map[*modelType]*sqlTable
 }
+
+type sqlTable struct {
+	table *sqlddl.Table
+	flags sqlTableFlags
+}
+
+type sqlTableFlags uint8
+
+const (
+	sqlTableExists sqlTableFlags = 1 << iota
+)
 
 func NewDBInfo(options ...DBInfoOption) (*DBInfo, error) {
 	dbi := &DBInfo{
@@ -390,43 +401,45 @@ func (dbi *DBInfo) AddToContext(ctx context.Context) context.Context {
 	return ctxutil.WithValue(ctx, (*DBInfo)(nil), dbi)
 }
 
-func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
+func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlTable {
 	createName := func(rawName string, nwt *NameWriterTo, sqlName *string) {
 		if *sqlName != "" {
 			return
 		}
 		*sqlName = nameString(rawName, getNameWriterTo(nwt, SnakeCaseLower))
 	}
-	createTable := func(mt *modelType) *sqlddl.Table {
-		t := &sqlddl.Table{
-			Columns:   make([]sqlddl.Column, len(mt.structFields)),
-			TableName: mt.sqlName,
+	createTable := func(mt *modelType) *sqlTable {
+		t := &sqlTable{
+			table: &sqlddl.Table{
+				Columns:   make([]sqlddl.Column, len(mt.structFields)),
+				TableName: mt.sqlName,
+			}
 		}
-		if t.TableName == (sqlddl.TableName{}) {
+		if t.table.TableName == (sqlddl.TableName{}) {
 			createName(
 				mt.rawName.SchemaName.Name,
 				&dbi.NameWritersTo.Schema,
-				&t.TableName.SchemaName.Name,
+				&t.table.TableName.SchemaName.Name,
 			)
 			createName(
 				mt.rawName.Name,
 				&dbi.NameWritersTo.Table,
-				&t.TableName.Name,
+				&t.table.TableName.Name,
 			)
 		}
 		type argType struct {
 			dbi *DBInfo
-			t   *sqlddl.Table
+			t   *sqlTable
 		}
 		if err := mt.iterFields(&argType{
 			dbi: dbi,
 			t:   t,
 		}, func(f *modelTypeIterField) error {
 			arg := f.arg.(*argType)
-			c := &arg.t.Columns[f.index]
+			c := &arg.t.table.Columns[f.index]
 			*c = sqlddl.Column{
 				ColumnName: sqlddl.ColumnName{
-					TableName: arg.t.TableName,
+					TableName: arg.t.table.TableName,
 					Name:      f.sqlName,
 				},
 				Type: f.sqlType,
@@ -446,11 +459,11 @@ func (dbi *DBInfo) sqlTableOf(mt *modelType) *sqlddl.Table {
 	}
 	key := interface{}(mt)
 	if v, loaded := dbi.sqlTables.Load(key); loaded {
-		return v.(*sqlddl.Table)
+		return v.(*sqlTable).table
 	}
 	t := createTable(mt)
 	if v, loaded := dbi.sqlTables.LoadOrStore(key, t); loaded {
-		return v.(*sqlddl.Table)
+		return v.(*sqlTable).table
 	}
 	return t
 }
